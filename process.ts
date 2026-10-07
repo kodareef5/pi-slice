@@ -4,11 +4,11 @@ import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { privateDir } from "./workspace.ts";
 
-export function exited(child: ChildProcess): Promise<number | null> {
+export function exited(child: ChildProcess, event: "close" | "exit" = "close"): Promise<number | null> {
   if (child.exitCode !== null || child.signalCode) return Promise.resolve(child.exitCode);
   return new Promise((resolve, reject) => {
     child.once("error", reject);
-    child.once("close", (code) => resolve(code));
+    child.once(event, (code) => resolve(code));
   });
 }
 

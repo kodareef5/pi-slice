@@ -56,7 +56,7 @@ export default function work(pi: ExtensionAPI) {
 Pi keeps normal auth and sessions. Your read, bash, edit and write tools run inside an OS sandbox.
 Bash, Bun (including TypeScript and bun:sqlite), Node/npm (including node:sqlite), Git and rg are available. Check other tools such as Python before relying on them.
 Default to Bun and TypeScript for new scripts and web projects: Bun.serve, Bun.file, bun run and bun add when dependencies are needed. Follow an existing project's stack or the user's preference.
-Match the requested scope. A basic HTML dashboard usually needs only index.html and a tiny server.ts, without framework scaffolding, custom APIs or a test harness. Inspect relevant project files; skip routine host/tool inventories. Do not assume Git is initialized.
+Match the requested scope. A basic HTML dashboard usually needs only index.html and a tiny server.ts, without framework scaffolding, custom APIs or a test harness. Inspect relevant project files; skip routine host/tool inventories. Do not assume Git is initialized.${process.platform === "darwin" ? " On macOS, new Git repositories must be initialized by the user in the host terminal; protected hooks/config prevent sandboxed git init. Git add/commit work for existing repositories." : ""}
 Project secrets remain readable; writes are limited to the workspace. Homes and Pi state are hidden; other host paths are generally read-only. Internet and local/LAN services are reachable through proxies. Linux permits Unix sockets on visible paths.
 HOME, caches and scratch files live under .pi-runtime. ${process.platform === "linux" ? "Background processes end with each shell command; run a server and its checks in the same command. Sandbox localhost is separate from the host browser." : "Local network binding is restricted."} Use git add <paths>; sandbox placeholders can break git add -A.
 Use work_service to start, inspect, read logs or stop one background service for this workspace when the user asks. It survives Pi/terminal exit, using systemd on Linux or launchd on macOS; unsupported hosts get an explanation. No automatic restart after reboot.
@@ -98,7 +98,8 @@ Pi documentation and skill paths listed elsewhere may be hidden. Use this sectio
       root = found.root;
       runtime = `Bun ${found.bunVersion} / Node ${found.nodeVersion}`;
       readWorkspace(root);
-      lock = commandLock(getAgentDir(), root, found.tools.flock);
+      lock = commandLock(getAgentDir(), root, found.tools.flock,
+        process.platform === "darwin" ? found.tools.bun : undefined);
       const env = await lock(async () => {
         const env = prepareRuntime(join(root, ".pi-runtime"), found.tools);
         manager = (await import("@anthropic-ai/sandbox-runtime")).SandboxManager;
@@ -305,7 +306,8 @@ if(Buffer.isBuffer(result))process.stdout.write(result);
             const found = requirements(ctx.cwd);
             text += `\nPi ${VERSION}; Node ${found.nodeVersion}; Bun ${found.bunVersion}: OK.\n` +
               "Git: use git add <paths>; runtime placeholders can prevent git add -A. Configure name/email on the host.\n" +
-              "Files are private (0600/0700). Linux background processes end with each command; macOS restricts local binding.";
+              "Files are private (0600/0700). Linux background processes end with each command; macOS restricts local binding." +
+              (process.platform === "darwin" ? "\nNew Git repositories: run git init in the host terminal; protected hooks/config prevent sandboxed initialization." : "");
             try { const backend = servicePlatform(found.root); await backend.check(); text += `\nBackground service: ${backend.name} available. Project read-only; private runtime writable. Survives Pi/terminal exit; logout behavior follows the user service manager. Not started automatically after reboot.`; }
             catch (error) { text += "\n" + String(error); }
             try { socketPrefix(getAgentDir()); }
@@ -331,7 +333,8 @@ if(Buffer.isBuffer(result))process.stdout.write(result);
           if (values[0] && values[0] !== "new") throw Error("Use /work init [new].");
           const existing = marked(found.root);
           if (existing) readWorkspace(found.root);
-          await (lock || commandLock(getAgentDir(), found.root, found.tools.flock))(async () => {
+          await (lock || commandLock(getAgentDir(), found.root, found.tools.flock,
+            process.platform === "darwin" ? found.tools.bun : undefined))(async () => {
             if (!existing || values[0]) writeWorkspace(found.root, { version: 1, id: randomUUID() });
             if (!existing) {
               prepareRuntime(join(found.root, ".pi-runtime"), found.tools);

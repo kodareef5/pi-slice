@@ -7,20 +7,30 @@ import {servicePlatform} from "../features/service-platform.ts";
 import {record, serviceAction, servicePaths} from "../features/service.ts";
 
 test("native supervisors receive literal arguments, bounded shutdown and no automatic restart", async t => {
-  const base = mkdtempSync(join(tmpdir(), "pi-work-backend-")), bin = join(base, "bin"), log = join(base, "calls");
+  const base = mkdtempSync(join(tmpdir(), "pi-work-backend-")), bin = join(base, "bin"), log = join(base, "calls"), status = join(base, "status");
   mkdirSync(bin);
+  writeFileSync(status, "state = running");
   const path = process.env.PATH;
   t.after(() => { process.env.PATH = path; rmSync(base, {recursive: true, force: true}); });
   for (const name of ["systemctl", "systemd-run", "launchctl"])
     writeFileSync(join(bin, name), `#!${process.execPath}
 require('fs').appendFileSync(${JSON.stringify(log)},JSON.stringify(process.argv.slice(2))+'\\n');
-console.log(${JSON.stringify(name === "systemctl" ? "active" : "state = running")});`, {mode: 0o755});
+${name === "launchctl" ? `const fs=require('fs'),status=${JSON.stringify(status)};
+if(process.argv[2]==='bootout')fs.writeFileSync(status,'state = waiting');
+if(process.argv[2]==='bootstrap')fs.writeFileSync(status,'state = running');
+console.log(fs.readFileSync(status,'utf8'));` : `console.log(${JSON.stringify(name === "systemctl" ? "active" : "state = running")});`}`, {mode: 0o755});
   process.env.PATH = bin;
   const args = ["/usr/bin/env", "-i", "PATH=/a & b", "/trusted/node", "<runner>", "'config'"];
   for (const platform of ["linux", "darwin"]) {
     const backend = servicePlatform(join(base, "project"), platform);
     await backend.check();
     assert.equal(await backend.active("pi-work-test"), true);
+    if (platform === "darwin") {
+      writeFileSync(status, "state = xpcproxy\npid = 12345\n");
+      assert.equal(await backend.active("pi-work-test"), true);
+      writeFileSync(status, "state = waiting\nruns = 1\nlast exit code = 0\n");
+      assert.equal(await backend.active("pi-work-test"), false);
+    }
     await backend.start("pi-work-test", args, base);
     await backend.stop("pi-work-test");
   }

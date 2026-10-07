@@ -14,6 +14,7 @@ git clone https://github.com/kodareef5/pi-work.git ~/pi-work
 cd ~/pi-work && npm ci --ignore-scripts
 pi install "$PWD"
 mkdir -p ~/my-project && cd ~/my-project
+git init # optional; on macOS, initialize Git here before entering Pi
 pi
 ```
 
@@ -47,4 +48,6 @@ Tool writes stay in the project; service runtime is private Pi state, never expo
 Proxied internet includes local/LAN services. Linux hides
 `/run` and `/var/run`, but permits sockets on other visible paths. Pi and global
 extensions remain trusted host code; running generated files on the host bypasses
-this boundary. Ubuntu tested; macOS and WSL unverified.
+this boundary. macOS protects Git hooks/config and their parent paths, so new Git
+repositories must be initialized from the host terminal. Git add/commit work inside
+Pi once the repository exists. Ubuntu and macOS tested; WSL unverified.

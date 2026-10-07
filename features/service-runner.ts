@@ -31,11 +31,21 @@ const note = (text: string | Buffer) => {
 };
 const stopChild = async () => {
   if (process.platform === "linux") return terminate(child);
-  if (!child || child.exitCode !== null || child.signalCode) return;
-  const done = exited(child);
-  child.kill("SIGTERM");
-  const timer = setTimeout(() => child?.kill("SIGKILL"), 3000);
-  try { await done; } finally { clearTimeout(timer); }
+  if (!child) return;
+  // launchd owns this process group. Wait for the direct child's exit, then
+  // close inherited pipes so descendants cannot prevent the runner exiting
+  // and launchd completing process-group cleanup.
+  try {
+    if (child.pid && child.exitCode === null && !child.signalCode) {
+      const done = exited(child, "exit");
+      child.kill("SIGTERM");
+      const timer = setTimeout(() => child?.kill("SIGKILL"), 3000);
+      try { await done; } finally { clearTimeout(timer); }
+    }
+  } finally {
+    child.stdout?.destroy();
+    child.stderr?.destroy();
+  }
 };
 function finish(error?: string) {
   return ending ??= (async () => {
@@ -61,7 +71,8 @@ async function launch(command: string, env: Record<string, string>) {
   child.stdout!.on("data", note);
   child.stderr!.on("data", note);
   // Keep completion inside an object so awaiting launch only waits for spawning.
-  return {done: exited(child).finally(() => manager.cleanupAfterCommand())};
+  return {done: exited(child, process.platform === "darwin" ? "exit" : "close")
+    .finally(() => manager.cleanupAfterCommand())};
 }
 
 function forward(socketPath: string) {

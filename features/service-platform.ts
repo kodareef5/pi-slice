@@ -48,7 +48,13 @@ export function servicePlatform(root: string, platform = process.platform) {
         catch { throw Error("Background services need a logged-in macOS launchd user session. Ordinary pi-work tools still work; no unsandboxed fallback is used."); }
       },
       async active(label: string) {
-        try { return /state = (running|spawn scheduled)/.test(await run("launchctl", ["print", domain + "/" + label])); }
+        try {
+          const status = await run("launchctl", ["print", domain + "/" + label]);
+          // launchd assigns a PID while xpcproxy is still preparing the process.
+          // Treat that startup phase as active so callers do not stop it early.
+          return /^\s*state = (running|spawn scheduled)\s*$/m.test(status) ||
+            /^\s*pid = [1-9]\d*\s*$/m.test(status);
+        }
         catch { return false; }
       },
       async start(label: string, args: string[], dir: string) {
@@ -58,7 +64,15 @@ export function servicePlatform(root: string, platform = process.platform) {
         writeFileSync(file, launchAgent(label, args, join(dir, "supervisor.log")), {mode: 0o600});
         await run("launchctl", ["bootstrap", domain, file]);
       },
-      async stop(label: string) { await run("launchctl", ["bootout", domain + "/" + label]); },
+      async stop(label: string) {
+        await run("launchctl", ["bootout", domain + "/" + label]);
+        // bootout can return while launchd is still terminating the job.
+        const deadline = Date.now() + 10000;
+        while (await this.active(label)) {
+          if (Date.now() >= deadline) throw Error("launchd service did not stop within 10 seconds.");
+          await new Promise(resolve => setTimeout(resolve, 50));
+        }
+      },
     };
   }
   throw Error("Background services support systemd on Linux and launchd on macOS. No backend is available on this platform.");

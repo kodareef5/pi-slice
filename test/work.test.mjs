@@ -108,7 +108,8 @@ async function start(t, cwd = project, { args = [], environment = env } = {}) {
   const exited = new Promise((resolve) => child.once("exit", resolve));
   const receive = async (type, match) => {
     try {
-      for await (const [event] of on(events, type, { signal: AbortSignal.timeout(30000) }))
+      // Service startup permits 45 seconds plus bounded supervisor shutdown.
+      for await (const [event] of on(events, type, { signal: AbortSignal.timeout(60000) }))
         if (match(event)) return event;
     } catch (error) {
       throw Error(stderr + notices.join("\n"), { cause: error });
@@ -693,8 +694,19 @@ test("archive extraction rejects traversal, escaping links, special files and du
 test("fresh Git initialization and commits use only host name/email", async (t) => {
   rmSync(join(project, ".git"), { recursive: true });
   const client = await start(t);
+  if (process.platform === "darwin") {
+    // Seatbelt pins the parents of protected hooks/config even before they
+    // exist. New repositories need host initialization; commits stay sandboxed.
+    const denied = await client.bash("git init");
+    assert.notEqual(denied.exitCode, 0);
+    assert.match(denied.output, /Operation not permitted|Permission denied/);
+    assert.equal(existsSync(join(project, ".git")), false);
+    const init = spawnSync("git", ["init", "--template=", project], {encoding: "utf8"});
+    assert.equal(init.status, 0, init.stderr);
+  }
   const result = await client.bash(
-    "git init && echo hello > hello.txt && git add hello.txt && git commit -m first && git log -1 --format='%an <%ae>'",
+    (process.platform === "linux" ? "git init && " : "") +
+    "echo hello > hello.txt && git add hello.txt && git commit -m first && git log -1 --format='%an <%ae>'",
   );
   assert.equal(result.exitCode, 0, result.output);
   assert.match(result.output, /Test Author <author@example.com>/);
@@ -703,12 +715,13 @@ test("fresh Git initialization and commits use only host name/email", async (t) 
 
 test(
   "same-workspace commands serialize cleanup; cancelled work releases the lock",
-  { skip: process.platform !== "linux" },
+  { timeout: 10000 },
   async (t) => {
     const a = await start(t),
       b = await start(t);
     const first = a.bash(
-      "echo started > .pi-runtime/started; sleep 1; test ! -e .pi-runtime/second; test -e .vscode; echo FIRST",
+      "echo started > .pi-runtime/started; sleep 1; test ! -e .pi-runtime/second; " +
+      (process.platform === "linux" ? "test -e .vscode; " : "") + "echo FIRST",
     );
     while (!existsSync(join(project, ".pi-runtime/started"))) await new Promise((r) => setTimeout(r, 20));
     const second = b.bash("touch .pi-runtime/second; mkdir .vscode 2>/dev/null; echo escape > .vscode/tasks.json");
@@ -756,15 +769,17 @@ test("unmarked Pi reaches the real import prompt without creating a sandbox", as
 });
 
 test(
-  "unavailable Linux locking fails closed before runtime preparation",
-  { skip: process.platform !== "linux" },
+  "unavailable workspace locking fails closed before runtime preparation",
   async (t) => {
     const bin = join(root, "no-lock"),
       folder = join(home, "no-lock");
     mkdirSync(bin);
     mkdirSync(folder);
     mark(folder);
-    writeFileSync(join(bin, "flock"), "#!/bin/sh\nexit 1\n", { mode: 0o700 });
+    writeFileSync(join(bin, process.platform === "linux" ? "flock" : "bun"),
+      process.platform === "linux" ? "#!/bin/sh\nexit 1\n" :
+        '#!/bin/sh\nif [ "$1" = "--version" ]; then echo 1.4.2; else exit 1; fi\n',
+      { mode: 0o700 });
     const client = await start(t, folder, { environment: { ...env, PATH: bin + ":" + env.PATH } });
     await blocked(client, /lock acquisition failed/);
     assert.equal(existsSync(join(folder, ".pi-runtime")), false);
