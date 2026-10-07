@@ -1,0 +1,1028 @@
+import test, { after, beforeEach } from "node:test";
+import assert from "node:assert/strict";
+import { spawn, spawnSync } from "node:child_process";
+import { createServer, get } from "node:http";
+import { createServer as socketServer } from "node:net";
+import {
+  mkdtempSync,
+  mkdirSync,
+  realpathSync,
+  readFileSync,
+  writeFileSync,
+  existsSync,
+  rmSync,
+  symlinkSync,
+  copyFileSync,
+  linkSync,
+  readdirSync,
+  statSync,
+} from "node:fs";
+import { dirname, join } from "node:path";
+import { tmpdir } from "node:os";
+import { createInterface } from "node:readline";
+import { EventEmitter, on } from "node:events";
+import { randomUUID } from "node:crypto";
+import { Header } from "tar";
+import { serviceAction, servicePaths } from "../features/service.ts";
+import { servicePlatform } from "../features/service-platform.ts";
+
+const packageRoot = dirname(import.meta.dirname);
+const pi = realpathSync(
+  process.env.PATH.split(":")
+    .map((dir) => join(dir, "pi"))
+    .find(existsSync),
+);
+const base = realpathSync(mkdtempSync(join(process.platform === "darwin" ? "/tmp" : tmpdir(), "pi-work-")));
+let root, home, agent, project, plain, outside, visible, env;
+const mark = (path) => writeFileSync(join(path, ".pi-work"), JSON.stringify({ version: 1, id: randomUUID() }));
+const settings = {
+  extensions: [join(packageRoot, "test/driver.ts")],
+  quietStartup: true,
+  defaultProvider: "openai",
+  defaultModel: "gpt-6-astra",
+};
+beforeEach(() => {
+  root = mkdtempSync(join(base, "case-"));
+  home = join(root, "h");
+  agent = join(root, "agent");
+  project = join(home, "p");
+  plain = join(home, "plain");
+  outside = join(home, "private.txt");
+  visible = join(root, "public.txt");
+  for (const path of [
+    agent,
+    project,
+    plain,
+    join(project, ".pi"),
+    join(project, ".git/hooks"),
+    join(project, ".pi-runtime"),
+  ])
+    mkdirSync(path, { recursive: true });
+  writeFileSync(outside, "host secret");
+  writeFileSync(visible, "read only");
+  mark(project);
+  writeFileSync(join(home, ".gitconfig"), "[user]\nname = Test Author\nemail = author@example.com\n");
+  for (const path of [".pi/sentinel", ".git/hooks/sentinel"]) writeFileSync(join(project, path), "protected");
+  writeFileSync(join(project, ".git/config"), "[core]\n");
+  writeFileSync(join(project, ".gitignore"), ".pi-runtime/\n");
+  writeFileSync(join(agent, "settings.json"), JSON.stringify(settings));
+  writeFileSync(join(agent, "auth.json"), JSON.stringify({ openai: { type: "api_key", key: "fixture-key" } }), {
+    mode: 0o600,
+  });
+  env = {
+    ...process.env,
+    HOME: home,
+    PI_CODING_AGENT_DIR: agent,
+    PI_WORK_TEST_SECRET: "fixture",
+    GH_TOKEN: "fixture-github",
+    AWS_SECRET_ACCESS_KEY: "fixture-aws",
+    OPENAI_API_KEY: "fixture-provider",
+    JAVA_TOOL_OPTIONS: "-Dpi.work.host=secret",
+    GIT_CONFIG_COUNT: "1",
+    GIT_CONFIG_KEY_0: "user.name",
+    GIT_CONFIG_VALUE_0: "HOST_INJECTION",
+  };
+  delete env.PI_CODING_AGENT_SESSION_DIR;
+});
+after(() => rmSync(base, { recursive: true, force: true }));
+
+async function start(t, cwd = project, { args = [], environment = env } = {}) {
+  const child = spawn(process.execPath, [pi, "--mode", "rpc", "--offline", ...args], { cwd, env: environment });
+  const events = new EventEmitter(),
+    notices = [];
+  let stderr = "",
+    nextId = 0;
+  child.stderr.on("data", (chunk) => {
+    stderr += chunk;
+  });
+  createInterface({ input: child.stdout }).on("line", (line) => {
+    let event;
+    try {
+      event = JSON.parse(line);
+    } catch {
+      return;
+    }
+    if (event.type === "extension_ui_request" && event.method === "notify") notices.push(event.message);
+    events.emit(event.type, event);
+  });
+  const exited = new Promise((resolve) => child.once("exit", resolve));
+  const receive = async (type, match) => {
+    try {
+      for await (const [event] of on(events, type, { signal: AbortSignal.timeout(30000) }))
+        if (match(event)) return event;
+    } catch (error) {
+      throw Error(stderr + notices.join("\n"), { cause: error });
+    }
+  };
+  const client = {
+    notices,
+    child,
+    exited,
+    receive,
+    async request(command) {
+      const id = String(++nextId),
+        reply = receive("response", (event) => event.id === id);
+      child.stdin.write(JSON.stringify({ id, ...command }) + "\n");
+      const response = await reply;
+      assert.equal(response.success, true, JSON.stringify(response));
+      return response.data;
+    },
+    async command(message, prefix = "FIXTURE:") {
+      const reply = receive(
+        "extension_ui_request",
+        (event) => event.method === "notify" && event.message.startsWith(prefix),
+      );
+      await this.request({ type: "prompt", message });
+      return (await reply).message;
+    },
+    async fixture(request) {
+      const { result, error } = JSON.parse((await this.command("/fixture " + JSON.stringify(request))).slice(8));
+      if (error) throw Error(error);
+      return result;
+    },
+    tool(tool, params) {
+      return this.fixture({ op: "tool", tool, params });
+    },
+    bash(command) {
+      return this.request({ type: "bash", command });
+    },
+    async close() {
+      child.kill();
+      await exited;
+    },
+  };
+  t.after(() => client.close());
+  client.state = await client.request({ type: "get_state" });
+  return client;
+}
+
+async function blocked(client, reason) {
+  const shell = await client.bash("echo MUST_NOT_RUN");
+  assert.equal(shell.exitCode, 1);
+  assert.match(shell.output, reason);
+  for (const tool of ["read", "write", "edit", "bash", "work_service", "fixture-host"])
+    await assert.rejects(client.tool(tool, {}), reason);
+}
+
+test("unmarked directories keep ordinary Pi, auth, environment and tools", async (t) => {
+  const original = readFileSync(join(agent, "auth.json"), "utf8"),
+    client = await start(t, plain);
+  const info = await client.fixture({ op: "info" });
+  assert.equal(info.home, home);
+  assert.equal(info.agent, agent);
+  assert.equal(info.secret, true);
+  assert.equal(info.umask, process.umask());
+  assert.deepEqual(info.overridden, []);
+  assert.ok(info.tools.includes("bash"));
+  assert.match((await client.bash(`cat '${outside}'`)).output, /host secret/);
+  assert.equal(existsSync(join(plain, ".pi-runtime")), false);
+  assert.equal(client.state.model.provider, "openai");
+  assert.equal(readFileSync(join(agent, "auth.json"), "utf8"), original);
+});
+
+test("init creates scratch and exits cleanly; restarting activates isolation", { timeout: 10000 }, async (t) => {
+  for (const path of [".pi-work", ".git", ".pi", ".pi-runtime", ".gitignore"])
+    rmSync(join(project, path), { recursive: true, force: true });
+  const client = await start(t);
+  const auth = readFileSync(join(agent, "auth.json"), "utf8");
+  assert.match(await client.command("/work init", "Workspace initialized."), /Run pi again/);
+  // Pi 1.0.4 RPC checks deferred shutdown on its next input after async commands.
+  await client.request({ type: "get_state" });
+  assert.equal(await client.exited, 0);
+  const config = JSON.parse(readFileSync(join(project, ".pi-work"), "utf8"));
+  assert.equal(config.version, 1);
+  assert.match(config.id, /^[0-9a-f-]{36}$/);
+  assert.equal(readFileSync(join(project, ".gitignore"), "utf8"), ".pi-runtime/\n");
+  assert.equal(existsSync(join(project, ".git")), false);
+  assert.equal(readFileSync(join(agent, "auth.json"), "utf8"), auth);
+  const restarted = await start(t);
+  assert.match(await restarted.command("/work", "pi-work\n"), /sandbox    healthy/);
+  await assert.rejects(restarted.tool("read", { path: outside }));
+  assert.equal(existsSync(join(home, ".pi/work")), false);
+});
+
+// Run the same assertions through model Bash and user ! commands.
+async function probe({ outside, visible, agent, port, nodeVersion, npmVersion }) {
+  const fs = require("node:fs"),
+    assert = require("node:assert/strict");
+  const denied = (fn) => assert.throws(fn, (error) => ["EPERM", "EACCES", "ENOENT", "EROFS"].includes(error.code));
+  assert.equal(process.env.HOME, process.cwd() + "/.pi-runtime/home");
+  assert.equal(process.env.TMPDIR, process.cwd() + "/.pi-runtime/tmp");
+  for (const name of [
+    "PI_WORK_TEST_SECRET",
+    "GH_TOKEN",
+    "AWS_SECRET_ACCESS_KEY",
+    "OPENAI_API_KEY",
+    "PI_CODING_AGENT_DIR",
+    "PI_SESSION_FILE",
+  ])
+    assert.equal(process.env[name], undefined, name);
+  assert.doesNotMatch(process.env.JAVA_TOOL_OPTIONS || "", /pi.work.host|secret/);
+  assert.doesNotMatch(
+    JSON.stringify(Object.fromEntries(Object.entries(process.env).filter(([key]) => key.startsWith("GIT_CONFIG_")))),
+    /HOST_INJECTION/,
+  );
+  const scratch = process.env.TMPDIR + "/probe.txt";
+  fs.writeFileSync(scratch, "ok");
+  assert.equal(fs.statSync(scratch).mode & 0o777, 0o600);
+  const { Database } = require("bun:sqlite"),
+    db = new Database(":memory:");
+  assert.equal(db.query("select 1 as v").get().v, 1);
+  db.close();
+  assert.equal(fs.readFileSync(visible, "utf8"), "read only");
+  denied(() => fs.writeFileSync(visible, "escape"));
+  for (const path of [outside, agent + "/auth.json", agent + "/settings.json"]) {
+    denied(() => fs.readFileSync(path));
+    if (process.platform === "linux") {
+      try {
+        fs.writeFileSync(path, "disposable");
+        fs.unlinkSync(path);
+      } catch (e) {
+        assert.ok(["EPERM", "EACCES", "ENOENT", "EROFS"].includes(e.code));
+      }
+    } else denied(() => fs.writeFileSync(path, "escape"));
+  }
+  for (const path of [".pi-work", ".pi/sentinel", ".git/config", ".git/hooks/sentinel", "/tmp/claude/pi-work-test"])
+    denied(() => fs.writeFileSync(path, "escape"));
+  const link = ".pi-runtime/link-" + process.pid;
+  fs.symlinkSync(outside, link);
+  denied(() => fs.readFileSync(link));
+  fs.unlinkSync(link);
+  for (const tool of ["node", "npm", "git", "rg"]) assert.equal(Bun.spawnSync([tool, "--version"]).exitCode, 0, tool);
+  assert.equal(Bun.spawnSync(["node", "--version"]).stdout.toString().trim(), nodeVersion);
+  assert.equal(Bun.spawnSync(["npm", "--version"]).stdout.toString().trim(), npmVersion);
+  const sqlite = Bun.spawnSync([
+    "node",
+    "--no-warnings",
+    "-e",
+    "const {DatabaseSync}=require('node:sqlite');const d=new DatabaseSync(':memory:');if(d.prepare('select 1 as v').get().v!==1)throw Error('SQLite');d.close();console.log('OK')",
+  ]);
+  assert.equal(sqlite.exitCode, 0, sqlite.stderr.toString());
+  assert.equal(sqlite.stdout.toString().trim(), "OK");
+  assert.notEqual(Bun.spawnSync(["node", "-e", `require('fs').readFileSync(${JSON.stringify(outside)})`]).exitCode, 0);
+  const net = require("node:net");
+  process.env.NO_PROXY = process.env.no_proxy = "";
+  assert.equal(
+    await (await fetch(`http://127.0.0.1:${port}/`, { proxy: process.env.HTTP_PROXY })).text(),
+    "proxy works",
+  );
+  const nodeFetch = Bun.spawnSync(
+    ["node", "--no-warnings", "-e", `fetch('http://127.0.0.1:${port}/').then(r=>r.text()).then(console.log)`],
+    { env: { ...process.env, NO_PROXY: "", no_proxy: "" } },
+  );
+  assert.equal(nodeFetch.exitCode, 0, nodeFetch.stderr.toString());
+  assert.equal(nodeFetch.stdout.toString().trim(), "proxy works");
+  const direct = await new Promise((resolve) => {
+    const socket = net.connect({ host: "127.0.0.1", port });
+    socket.setTimeout(1000, () => {
+      socket.destroy();
+      resolve(false);
+    });
+    socket.on("connect", () => {
+      socket.destroy();
+      resolve(true);
+    });
+    socket.on("error", () => resolve(false));
+  });
+  assert.equal(direct, false);
+  console.log("PASS");
+}
+
+test("model and user shells confine files, subprocesses, credentials and network", async (t) => {
+  for (const dir of [".pi", ".git/hooks"]) mkdirSync(join(project, dir), { recursive: true });
+  for (const path of [".pi/sentinel", ".git/config", ".git/hooks/sentinel"])
+    writeFileSync(join(project, path), "protected");
+  const originals = [outside, join(agent, "auth.json"), join(agent, "settings.json")].map((path) => [
+    path,
+    readFileSync(path, "utf8"),
+  ]);
+  const server = createServer((_req, res) => res.end("proxy works"));
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  const client = await start(t);
+  const config = {
+    outside,
+    visible,
+    agent,
+    port: server.address().port,
+    nodeVersion: spawnSync("node", ["--version"], { encoding: "utf8" }).stdout.trim(),
+    npmVersion: spawnSync("npm", ["--version"], { encoding: "utf8" }).stdout.trim(),
+  };
+  writeFileSync(join(project, ".pi-runtime/probe.mjs"), `await (${probe.toString()})(${JSON.stringify(config)});`);
+  const command = "bun --no-env-file .pi-runtime/probe.mjs";
+  const user = await client.bash(command),
+    model = (await client.tool("bash", { command })).structuredContent;
+  for (const result of [{ exitCode: model.exit_code, output: model.output }, user]) {
+    assert.equal(result.exitCode, 0, result.output);
+    assert.equal(result.output.trim(), "PASS");
+  }
+  const info = await client.fixture({ op: "info" });
+  assert.equal(info.home, home);
+  assert.equal(info.secret, true);
+  assert.deepEqual(info.tools.sort(), ["bash", "edit", "read", "work_service", "write"]);
+  assert.ok(client.state.sessionFile.startsWith(join(agent, "sessions") + "/"));
+  for (const [path, original] of originals) assert.equal(readFileSync(path, "utf8"), original);
+});
+
+test("file tools preserve text, edits and images without exposing host files", async (t) => {
+  const client = await start(t),
+    content = "literal $(touch /tmp/pi-work-must-not-run) ' quotes\n" + "x".repeat(150000);
+  await client.tool("write", { path: "large.txt", content });
+  assert.equal(readFileSync(join(project, "large.txt"), "utf8"), content);
+  await client.tool("edit", { path: "large.txt", edits: [{ oldText: "literal", newText: "edited" }] });
+  assert.match((await client.tool("read", { path: "large.txt", limit: 1 })).content[0].text, /^edited/);
+  symlinkSync(outside, join(project, "host-link"));
+  symlinkSync(visible, join(project, "visible-link"));
+  for (const path of [outside, join(agent, "auth.json"), "host-link"])
+    await assert.rejects(client.tool("read", { path }));
+  assert.match((await client.tool("read", { path: "visible-link" })).content[0].text, /read only/);
+  for (const path of [".pi-work", ".pi/sentinel", ".git/config", ".git/hooks/sentinel", visible, "visible-link"]) {
+    await assert.rejects(client.tool("write", { path, content: "escape" }), /EPERM|EACCES|EROFS|ENOENT/);
+    await assert.rejects(client.tool("edit", { path, edits: [{ oldText: "protected", newText: "escape" }] }));
+  }
+  // Linux can write disposable copies of hidden paths; the original must stay untouched.
+  try {
+    await client.tool("write", { path: "host-link", content: "escape" });
+  } catch (error) {
+    assert.match(String(error), /EPERM|EACCES|EROFS|ENOENT/);
+  }
+  await assert.rejects(client.tool("read", { path: "host-link" }));
+  assert.equal(readFileSync(outside, "utf8"), "host secret");
+  assert.equal(readFileSync(visible, "utf8"), "read only");
+  await assert.rejects(client.tool("fixture-host", {}), /Only read, bash, edit, write and work_service/);
+  writeFileSync(
+    join(project, "pixel.png"),
+    Buffer.from(
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+      "base64",
+    ),
+  );
+  assert.ok((await client.tool("read", { path: "pixel.png" })).content.some((block) => block.type === "image"));
+});
+
+test("project extensions cannot run even with saved trust", async (t) => {
+  const sentinel = join(root, "project-extension-ran");
+  writeFileSync(join(project, ".pi/settings.json"), JSON.stringify({ extensions: ["bad.ts"] }));
+  writeFileSync(
+    join(project, ".pi/bad.ts"),
+    `import{writeFileSync}from'node:fs';writeFileSync(${JSON.stringify(sentinel)},'unsafe');export default()=>{};`,
+  );
+  writeFileSync(join(agent, "trust.json"), JSON.stringify({ [project]: true }));
+  t.after(() => {
+    rmSync(join(project, ".pi/settings.json"));
+    rmSync(join(project, ".pi/bad.ts"));
+  });
+  const client = await start(t);
+  assert.equal(existsSync(sentinel), false);
+  assert.equal((await client.fixture({ op: "info" })).trusted, false);
+  assert.equal((await client.bash("echo PASS")).exitCode, 0);
+});
+
+test("continue and resume keep native sessions and auth", async (t) => {
+  const before = readFileSync(join(agent, "auth.json"), "utf8"),
+    client = await start(t);
+  const file = client.state.sessionFile;
+  await client.fixture({ op: "persist" });
+  await client.bash("echo NATIVE_SESSION");
+  await client.close();
+  for (const args of [["-c"], ["--session", file]]) {
+    const resumed = await start(t, project, { args });
+    assert.equal(resumed.state.sessionFile, file);
+    assert.equal(resumed.state.model.provider, "openai");
+    assert.equal((await resumed.bash("echo PASS")).exitCode, 0);
+    await resumed.close();
+  }
+  assert.equal(readFileSync(join(agent, "auth.json"), "utf8"), before);
+  assert.equal(existsSync(join(home, ".pi/work")), false);
+});
+
+test("session switching follows ctx.cwd and restores unmarked directories", async (t) => {
+  const other = join(home, "q");
+  mkdirSync(other);
+  mark(other);
+  writeFileSync(join(other, "which.txt"), "second workspace");
+  for (const dir of [".git/hooks", ".vscode", "vendor/x/.git/hooks"]) mkdirSync(join(other, dir), { recursive: true });
+  writeFileSync(join(other, ".git/config"), "[core]\n");
+  writeFileSync(join(other, "vendor/x/.git/hooks/existing"), "protected");
+  const target = await start(t, other),
+    targetFile = target.state.sessionFile;
+  await target.fixture({ op: "persist" });
+  await target.close();
+  const ordinary = await start(t, plain),
+    plainFile = ordinary.state.sessionFile;
+  await ordinary.fixture({ op: "persist" });
+  await ordinary.close();
+  const first = await start(t), firstFile = first.state.sessionFile;
+  await first.fixture({ op: "persist" }); await first.close();
+  const client = await start(t, plain);
+  await client.request({ type: "switch_session", sessionPath: firstFile });
+  assert.equal((await client.fixture({ op: "info" })).processCwd, plain);
+  await client.request({ type: "switch_session", sessionPath: targetFile });
+  assert.equal((await client.fixture({ op: "info" })).cwd, other);
+  assert.equal((await client.fixture({ op: "info" })).processCwd, plain);
+  for (const path of [".git/hooks/new", ".git/config", ".vscode/tasks.json", "vendor/x/.git/hooks/new"])
+    await assert.rejects(client.tool("write", { path, content: "escape" }));
+  assert.match((await client.tool("read", { path: "which.txt" })).content[0].text, /second workspace/);
+  await assert.rejects(client.tool("read", { path: join(project, "large.txt") }));
+  assert.equal((await client.bash("pwd")).output.trim(), other);
+  assert.equal((await client.fixture({ op: "info" })).processCwd, plain);
+  await client.request({ type: "switch_session", sessionPath: plainFile });
+  const info = await client.fixture({ op: "info" });
+  assert.equal(info.cwd, plain);
+  assert.equal(info.processCwd, plain);
+  assert.deepEqual(info.overridden, []);
+  assert.match((await client.bash(`cat '${outside}'`)).output, /host secret/);
+});
+
+test(
+  "Linux hides home and runtime sockets but permits project and /tmp sockets",
+  { skip: process.platform !== "linux" },
+  async (t) => {
+    const visible = [join(project, ".pi-runtime/visible.sock"), join(root, "host.sock")],
+      hidden = [join(home, "hidden.sock")];
+    for (const base of ["/run", "/var/run"]) {
+      const dir = mkdtempSync(join(base, process.getuid() === 0 ? "" : `user/${process.getuid()}`, "pi-work-"));
+      t.after(() => rmSync(dir, { recursive: true, force: true }));
+      hidden.push(join(dir, "host.sock"));
+    }
+    for (const path of [...visible, ...hidden]) {
+      const server = socketServer((socket) => socket.end("OK"));
+      await new Promise((resolve, reject) => {
+        server.once("error", reject);
+        server.listen(path, resolve);
+      });
+      t.after(() => new Promise((resolve) => server.close(resolve)));
+    }
+    const client = await start(t);
+    async function sockets({ visible, hidden }) {
+      const net = require("node:net"),
+        assert = require("node:assert/strict"),
+        fs = require("node:fs");
+      const connect = (path) =>
+        new Promise((resolve, reject) => {
+          const s = net.connect(path);
+          let text = "";
+          s.setTimeout(3000, () => s.destroy(Error("timeout")));
+          s.on("data", (data) => (text += data));
+          s.on("end", () => resolve(text));
+          s.on("error", reject);
+        });
+      for (const path of visible) assert.equal(await connect(path), "OK");
+      for (const path of hidden) {
+        await assert.rejects(connect(path), /ENOENT|EACCES|EPERM/);
+        fs.symlinkSync(path, ".pi-runtime/socket-link");
+        await assert.rejects(connect(".pi-runtime/socket-link"), /ENOENT|EACCES|EPERM/);
+        fs.unlinkSync(".pi-runtime/socket-link");
+      }
+      console.log("PASS");
+    }
+    writeFileSync(
+      join(project, ".pi-runtime/sockets.mjs"),
+      `await (${sockets.toString()})(${JSON.stringify({ visible, hidden })});`,
+    );
+    const command = "bun --no-env-file .pi-runtime/sockets.mjs",
+      user = await client.bash(command),
+      model = (await client.tool("bash", { command })).structuredContent;
+    for (const result of [user, { exitCode: model.exit_code, output: model.output }]) {
+      assert.equal(result.exitCode, 0, result.output);
+      assert.equal(result.output.trim(), "PASS");
+    }
+  },
+);
+
+test("dependency drift and an unconfined runtime block every tool", async (t) => {
+  const isolated = join(root, "package"),
+    runtime = join(isolated, "node_modules/@anthropic-ai/sandbox-runtime");
+  mkdirSync(runtime, { recursive: true });
+  mkdirSync(join(isolated, "test"));
+  mkdirSync(join(isolated, "features"));
+  for (const file of ["extension.ts", "sandbox.ts", "workspace.ts", "process.ts", "features/service.ts", "features/service-platform.ts", "test/driver.ts"])
+    copyFileSync(join(packageRoot, file), join(isolated, file));
+  writeFileSync(join(isolated, "package.json"), '{"type":"module"}');
+  writeFileSync(
+    join(runtime, "index.js"),
+    "export const SandboxManager={initialize:async()=>{},wrapWithSandbox:async command=>command,cleanupAfterCommand(){},reset:async()=>{}};",
+  );
+  writeFileSync(
+    join(agent, "settings.json"),
+    JSON.stringify({ ...settings, extensions: [join(isolated, "test/driver.ts")] }),
+  );
+  t.after(() => writeFileSync(join(agent, "settings.json"), JSON.stringify(settings)));
+  for (const version of ["0.0.77", "0.0.78"]) {
+    writeFileSync(
+      join(runtime, "package.json"),
+      JSON.stringify({ name: "@anthropic-ai/sandbox-runtime", version, type: "module", main: "index.js" }),
+    );
+    const client = await start(t);
+    await blocked(
+      client,
+      version === "0.0.77" ? /Unsupported sandbox-runtime version/ : /Sandbox startup probe failed/,
+    );
+    await client.close();
+  }
+});
+
+test("removing the marker cannot disable a running sandbox", async (t) => {
+  const client = await start(t);
+  rmSync(join(project, ".pi-work"));
+  t.after(() => mark(project));
+  assert.match((await client.bash("echo $HOME")).output, /\.pi-runtime\/home/);
+  await assert.rejects(client.tool("read", { path: outside }));
+  await assert.rejects(client.tool("fixture-host", {}), /Only read, bash, edit, write and work_service/);
+});
+
+test("Node version rejection happens before workspace mutation", async (t) => {
+  const bin = join(root, "fake-bin");
+  mkdirSync(bin);
+  for (const [index, script] of [
+    "echo v22.19.0",
+    "echo invalid",
+    "echo v24.0.0; exit 1",
+    "echo v24.0.0-rc.1",
+  ].entries()) {
+    writeFileSync(join(bin, "node"), "#!/bin/sh\n" + script + "\n", { mode: 0o755 });
+    const folder = join(home, "version-" + index);
+    mkdirSync(folder);
+    const environment = { ...env, PATH: bin + ":" + env.PATH };
+    let client = await start(t, folder, { environment });
+    await client.command("/work init", "pi-work: node >=24.0.0 required.");
+    assert.equal(existsSync(join(folder, ".pi-runtime")), false);
+    assert.equal(existsSync(join(folder, ".pi-work")), false);
+    assert.equal(existsSync(join(agent, "pi-work")), false);
+    await client.close();
+    mark(folder);
+    client = await start(t, folder, { environment });
+    assert.equal(existsSync(join(folder, ".pi-runtime")), false);
+    await blocked(client, /node >=24.0.0 required/);
+    await client.close();
+  }
+});
+
+test("invalid markers block tools before creating runtime state", async (t) => {
+  for (const [index, text] of [
+    "{",
+    "null",
+    '{"version":2}',
+    '{"version":1,"allowRead":["/"]}',
+    '{"version":1,"id":"../other"}',
+    '{"version":1,"profile":"unknown"}',
+  ].entries()) {
+    const folder = join(home, "marker-" + index);
+    mkdirSync(folder);
+    writeFileSync(join(folder, ".pi-work"), text);
+    const client = await start(t, folder);
+    await blocked(client, /pi-work:/);
+    await client.command("/work init", "pi-work:");
+    assert.equal(existsSync(join(folder, ".pi-runtime")), false);
+    assert.equal(readFileSync(join(folder, ".pi-work"), "utf8"), text);
+    await client.close();
+  }
+});
+
+test("doctor and repeated init preserve project and Pi settings", async (t) => {
+  const before = readFileSync(join(agent, "settings.json"), "utf8"),
+    client = await start(t);
+  assert.match(await client.command("/work doctor", "pi-work\n"), /sandbox    healthy/);
+  await client.command("/work init", "This workspace is already isolated.");
+  assert.match(await client.command("/work", "pi-work\n"), /sandbox    healthy/);
+  assert.equal(readFileSync(join(project, ".gitignore"), "utf8"), ".pi-runtime/\n");
+  assert.equal(readFileSync(join(agent, "settings.json"), "utf8"), before);
+});
+
+test("Node without SQLite fails the startup probe", async (t) => {
+  const bin = join(root, "no-sqlite");
+  mkdirSync(bin);
+  writeFileSync(join(bin, "node"), '#!/bin/sh\nif [ "$1" = --version ]; then echo v24.0.0; else exit 1; fi\n', {
+    mode: 0o755,
+  });
+  await blocked(
+    await start(t, project, { environment: { ...env, PATH: bin + ":" + env.PATH } }),
+    /Sandbox startup probe failed/,
+  );
+});
+
+test("unsafe runtime symlinks and workspaces inside Pi state block tools", async (t) => {
+  const folder = join(home, "unsafe-runtime");
+  mkdirSync(folder);
+  mark(folder);
+  symlinkSync(agent, join(folder, ".pi-runtime"));
+  const nested = join(agent, "unsafe-workspace");
+  mkdirSync(nested);
+  mark(nested);
+  for (const cwd of [folder, nested]) {
+    await blocked(await start(t, cwd), /Unsafe runtime path|outside trusted Pi state/);
+    assert.equal(existsSync(join(agent, "bin")), false);
+  }
+});
+
+test("snapshots carry only workspace assets and Git with fresh identity", async (t) => {
+  const source = join(home, "assets"),
+    destination = join(home, "imported");
+  mkdirSync(source);
+  mark(source);
+  const client = await start(t, source);
+  await client.command("/work init", "This workspace is already isolated.");
+  for (const path of ["src", ".git", "node_modules", ".pi-runtime/data"])
+    mkdirSync(join(source, path), { recursive: true });
+  for (const [path, content] of [
+    ["src/run.sh", "#!/bin/sh\necho portable\n"],
+    [".git/config", "[core]\n"],
+    [".env", "PROJECT_SECRET=asset"],
+    ["node_modules/omit", "cache"],
+    [".pi-runtime/data/omit", "runtime"],
+  ])
+    writeFileSync(join(source, path), content, { mode: path.endsWith(".sh") ? 0o751 : 0o600 });
+  symlinkSync("src/run.sh", join(source, "internal-link"));
+  symlinkSync("../private.txt", join(source, "external-link"));
+  await client.fixture({ op: "persist", text: "PORTABLE_CONVERSATION" });
+  const file = await client.fixture({ op: "pack" });
+  await client.fixture({ op: "unpack", file, destination });
+  assert.equal(readFileSync(join(destination, "src/run.sh"), "utf8"), readFileSync(join(source, "src/run.sh"), "utf8"));
+  const { statSync, readlinkSync } = await import("node:fs");
+  assert.equal(statSync(join(destination, "src/run.sh")).mode & 0o777, 0o751);
+  assert.equal(readlinkSync(join(destination, "internal-link")), "src/run.sh");
+  assert.equal(readFileSync(join(destination, ".env"), "utf8"), "PROJECT_SECRET=asset");
+  assert.equal(readFileSync(join(destination, ".git/config"), "utf8"), "[core]\n");
+  for (const path of ["node_modules", ".pi-runtime", "external-link"])
+    assert.equal(existsSync(join(destination, path)), false);
+  const config = JSON.parse(readFileSync(join(destination, ".pi-work"), "utf8"));
+  assert.deepEqual(Object.keys(config).sort(), ["id", "version"]);
+  assert.notEqual(config.id, JSON.parse(readFileSync(join(source, ".pi-work"), "utf8")).id);
+  assert.equal(existsSync(join(destination, ".pi-history")), false);
+  assert.doesNotMatch(readFileSync(file, "utf8"), /PORTABLE_CONVERSATION|fixture-key|fixture-github/);
+  await assert.rejects(client.fixture({ op: "unpack", file, destination }), /new destination/);
+  const imported = await start(t, destination);
+  assert.notEqual(imported.state.sessionId, client.state.sessionId);
+  assert.equal((await imported.bash("echo PASS")).output.trim(), "PASS");
+});
+
+test("archive extraction rejects traversal, escaping links, special files and duplicates", async (t) => {
+  const client = await start(t);
+  for (const [index, entries] of [
+    [{ path: "../escape", type: "File", data: "bad" }],
+    [{ path: "/tmp/escape", type: "File", data: "bad" }],
+    [{ path: "link", type: "SymbolicLink", linkpath: "../escape" }],
+    [{ path: "fifo", type: "FIFO" }],
+    [{ path: ".", type: "SymbolicLink", linkpath: "sub" }],
+    [{ path: "root", type: "SymbolicLink", linkpath: "." }, { path: "escape", type: "SymbolicLink", linkpath: "root/../outside" }],
+    [{ path: "a", type: "SymbolicLink", linkpath: "b" }, { path: "b", type: "SymbolicLink", linkpath: "a" }],
+    [{ path: "sym", type: "SymbolicLink", linkpath: "asset" }, { path: "hard", type: "Link", linkpath: "sym" }],
+    [
+      { path: "same", type: "File", data: "first" },
+      { path: "same", type: "File", data: "second" },
+    ],
+    [
+      { path: "dir", type: "SymbolicLink", linkpath: "inside" },
+      { path: "dir/file", type: "File", data: "bad" },
+    ],
+  ].entries()) {
+    const blocks = [];
+    for (const entry of entries) {
+      const body = Buffer.from(entry.data || ""),
+        header = new Header({ ...entry, size: body.length, mode: 0o600 });
+      header.encode();
+      blocks.push(header.block, body, Buffer.alloc((512 - (body.length % 512)) % 512));
+    }
+    const file = join(root, "malicious-" + index + ".tar");
+    writeFileSync(file, Buffer.concat([...blocks, Buffer.alloc(1024)]));
+    await assert.rejects(client.fixture({ op: "extract", file }), /Unsafe|Archive link|Unsupported|symbolic link/);
+  }
+  assert.equal(existsSync(join(root, "escape")), false);
+});
+
+test("fresh Git initialization and commits use only host name/email", async (t) => {
+  rmSync(join(project, ".git"), { recursive: true });
+  const client = await start(t);
+  const result = await client.bash(
+    "git init && echo hello > hello.txt && git add hello.txt && git commit -m first && git log -1 --format='%an <%ae>'",
+  );
+  assert.equal(result.exitCode, 0, result.output);
+  assert.match(result.output, /Test Author <author@example.com>/);
+  await assert.rejects(client.tool("write", { path: ".git/hooks/pre-commit", content: "escape" }));
+});
+
+test(
+  "same-workspace commands serialize cleanup; cancelled work releases the lock",
+  { skip: process.platform !== "linux" },
+  async (t) => {
+    const a = await start(t),
+      b = await start(t);
+    const first = a.bash(
+      "echo started > .pi-runtime/started; sleep 1; test ! -e .pi-runtime/second; test -e .vscode; echo FIRST",
+    );
+    while (!existsSync(join(project, ".pi-runtime/started"))) await new Promise((r) => setTimeout(r, 20));
+    const second = b.bash("touch .pi-runtime/second; mkdir .vscode 2>/dev/null; echo escape > .vscode/tasks.json");
+    assert.equal((await first).exitCode, 0);
+    assert.notEqual((await second).exitCode, 0);
+    assert.equal(existsSync(join(project, ".vscode/tasks.json")), false);
+    const tool = a.fixture({ op: "cancel", command: "echo started > .pi-runtime/cancel; sleep 20; touch late" });
+    assert.match(await tool, /abort|cancel/i);
+    const after = await b.bash("echo RELEASED");
+    assert.equal(after.output.trim(), "RELEASED");
+    assert.equal(existsSync(join(project, "late")), false);
+  },
+);
+
+test("export rejects absolute links and restores metadata without truncating hardlinked assets", async (t) => {
+  const client = await start(t);
+  writeFileSync(join(project, "asset"), "ORIGINAL");
+  symlinkSync(join(project, "asset"), join(project, "absolute-link"));
+  await assert.rejects(client.fixture({ op: "pack" }), /Absolute symlink: absolute-link/);
+  rmSync(join(project, "absolute-link"));
+  symlinkSync(".", join(project, "root-link"));
+  symlinkSync("root-link/../outside", join(project, "indirect-link"));
+  await assert.rejects(client.fixture({ op: "pack" }), /Archive link leaves/);
+  rmSync(join(project, "root-link")); rmSync(join(project, "indirect-link"));
+  writeFileSync(join(project, ".gitignore"), "# original\n");
+  linkSync(join(project, ".pi-work"), join(project, "marker-copy"));
+  linkSync(join(project, ".gitignore"), join(project, "ignore-copy"));
+  const marker = readFileSync(join(project, "marker-copy"), "utf8"),
+    ignore = readFileSync(join(project, "ignore-copy"), "utf8");
+  const file = await client.fixture({ op: "pack" }),
+    destination = join(home, "restored-links");
+  await client.fixture({ op: "unpack", file, destination });
+  assert.equal(readFileSync(join(destination, "asset"), "utf8"), "ORIGINAL");
+  assert.equal(readFileSync(join(destination, "marker-copy"), "utf8"), marker);
+  assert.equal(readFileSync(join(destination, "ignore-copy"), "utf8"), ignore);
+
+});
+
+test("unmarked Pi reaches the real import prompt without creating a sandbox", async (t) => {
+  const client = await start(t, plain);
+  await client.command("/work import ../missing.piw ../new", "pi-work: Restore needs interactive Pi");
+  assert.equal(existsSync(join(plain, ".pi-runtime")), false);
+  for (const command of ["web", "share", "snapshot", "restore", "doctor export", "doctor arbitrary", "init gold"])
+    await client.command("/work " + command, "pi-work: Use /work");
+});
+
+test(
+  "unavailable Linux locking fails closed before runtime preparation",
+  { skip: process.platform !== "linux" },
+  async (t) => {
+    const bin = join(root, "no-lock"),
+      folder = join(home, "no-lock");
+    mkdirSync(bin);
+    mkdirSync(folder);
+    mark(folder);
+    writeFileSync(join(bin, "flock"), "#!/bin/sh\nexit 1\n", { mode: 0o700 });
+    const client = await start(t, folder, { environment: { ...env, PATH: bin + ":" + env.PATH } });
+    await blocked(client, /lock acquisition failed/);
+    assert.equal(existsSync(join(folder, ".pi-runtime")), false);
+  },
+);
+
+test("owner death terminates an active Linux sandbox command", { skip: process.platform !== "linux" }, async (t) => {
+  const client = await start(t);
+  // Send without waiting for a reply from the owner we are deliberately killing.
+  client.child.stdin.write(
+    JSON.stringify({
+      id: "orphan",
+      type: "bash",
+      command: "touch .pi-runtime/running; sleep 2; touch .pi-runtime/orphan",
+    }) + "\n",
+  );
+  while (!existsSync(join(project, ".pi-runtime/running"))) await new Promise((resolve) => setTimeout(resolve, 20));
+  client.child.kill("SIGKILL");
+  await client.close();
+  await new Promise((resolve) => setTimeout(resolve, 2200));
+  assert.equal(existsSync(join(project, ".pi-runtime/orphan")), false);
+  const next = await start(t);
+  assert.equal((await next.bash("echo RECOVERED")).output.trim(), "RECOVERED");
+});
+
+
+test("status is read-only in both unmarked and marked Pi", async t => {
+  for (const cwd of [plain, project]) {
+    const client = await start(t, cwd), before = readdirSync(cwd);
+    const text = await client.command("/work", "pi-work\n");
+    assert.match(text, cwd === plain ? /unmarked/ : /sandbox    healthy/);
+    assert.deepEqual(readdirSync(cwd), before);
+    assert.equal(existsSync(join(agent, "pi-work", JSON.parse(readFileSync(join(project,".pi-work"),"utf8")).id)), false);
+  }
+});
+
+const nativeServices = process.platform === "linux"
+  ? spawnSync("systemctl", ["--user", "show-environment"], {stdio: "ignore"}).status === 0
+  : process.platform === "darwin" && spawnSync("launchctl", ["print", "gui/" + process.getuid()], {stdio: "ignore"}).status === 0;
+const serviceSkip = nativeServices ? false : "Native service tests need a systemd user manager or launchd GUI session.";
+if (serviceSkip) console.warn("WARNING: " + serviceSkip + " Service integration coverage is skipped.");
+if (process.env.PI_WORK_REQUIRE_SERVICES === "1")
+  assert.ok(nativeServices, "Native service tests are required here; refusing to skip them.");
+const service = async (client, params) => JSON.parse((await client.tool("work_service", params)).content[0].text);
+function cleanupService(t) {
+  const backend = servicePlatform(project), {label} = servicePaths(project, agent);
+  t.after(async () => { if (await backend.active(label)) await backend.stop(label); });
+}
+
+test("a sandboxed preview survives Pi, permits edits and keeps its boundary after command cleanup", {skip: serviceSkip}, async t => {
+  cleanupService(t);
+  writeFileSync(join(project, "index.html"), "FIRST");
+  writeFileSync(join(project, "server.ts"), `
+import fs from 'node:fs'; import assert from 'node:assert/strict';
+function check(){
+ for(const p of ${JSON.stringify([outside, join(agent, "auth.json")])}) assert.throws(()=>fs.readFileSync(p));
+ for(const p of ['.pi-work','.git/config','.git/hooks/sentinel','asset-write']) assert.throws(()=>fs.writeFileSync(p,'bad'));
+ for(const k of ['GH_TOKEN','OPENAI_API_KEY','AWS_SECRET_ACCESS_KEY','PI_WORK_TEST_SECRET']) assert.equal(process.env[k],undefined,k);
+ assert.doesNotMatch(process.env.JAVA_TOOL_OPTIONS||'',/pi.work.host|secret/);
+ assert.doesNotMatch(JSON.stringify(Object.fromEntries(Object.entries(process.env).filter(([k])=>k.startsWith('GIT_CONFIG_')))),/HOST_INJECTION/);
+ fs.writeFileSync(process.env.XDG_DATA_HOME+'/state','private runtime');
+ return 'PASS';
+}
+Bun.serve({unix:process.env.PI_WORK_SOCKET,fetch(req,server){
+ const p=new URL(req.url).pathname;
+ if(p==='/ws'&&server.upgrade(req))return;
+ return new Response(p==='/check'?check():Bun.file('index.html'));
+},websocket:{message(ws,message){ws.send(message)}}});
+console.log('PREVIEW_READY');`);
+  const client = await start(t), other = await start(t);
+  const [state, same] = await Promise.all([client, other].map(c => service(c, {action: "start", command: "bun run server.ts"})));
+  assert.equal(state.state, "running"); assert.equal(same.url, state.url);
+  assert.match(state.url, /^http:\/\/127\.0\.0\.1:\d+$/);
+  assert.equal(await (await fetch(state.url)).text(), "FIRST");
+  assert.equal(await (await fetch(state.url + "/check")).text(), "PASS");
+  assert.equal((await fetch(state.url, {headers: {origin: "https://untrusted.example"}})).status, 403);
+  const spoofed = await new Promise((resolve, reject) => {
+    get(state.url, {headers: {host: "untrusted.example"}}, res => {res.resume(); resolve(res.statusCode);}).on("error", reject);
+  });
+  assert.equal(spoofed, 403);
+  assert.equal((await fetch(state.url, {headers: {"sec-fetch-site": "cross-site"}})).status, 403);
+  const navigate = {"sec-fetch-site": "cross-site", "sec-fetch-mode": "navigate", "sec-fetch-dest": "document"};
+  // http.get preserves Fetch Metadata headers; native fetch overwrites its mode.
+  const navigation = headers => new Promise((resolve, reject) => {
+    get(state.url, {headers}, res => {res.resume(); resolve(res.statusCode);}).on("error", reject);
+  });
+  assert.equal(await navigation(navigate), 200);
+  assert.equal(await navigation({...navigate, "sec-fetch-dest": "iframe"}), 403);
+  assert.equal(await navigation({...navigate, origin: "https://untrusted.example"}), 403);
+  assert.equal((await fetch(state.url, {method: "POST", headers: navigate})).status, 403);
+  const ws = new WebSocket(state.url.replace("http:", "ws:") + "/ws");
+  await new Promise((resolve, reject) => { ws.onopen = resolve; ws.onerror = reject; });
+  const echo = new Promise(resolve => { ws.onmessage = event => resolve(event.data); });
+  ws.send("echo"); assert.equal(await echo, "echo"); ws.close();
+  await client.tool("write", {path: "index.html", content: "EDITED"});
+  for (let i = 0; i < 3; i++) await other.bash("true");
+  await assert.rejects(client.tool("read", {path: servicePaths(project, agent).config}));
+  await client.close();
+  other.child.kill("SIGKILL"); await other.exited;
+  assert.equal(await (await fetch(state.url)).text(), "EDITED");
+  assert.equal(await (await fetch(state.url + "/check")).text(), "PASS");
+  const resumed = await start(t);
+  assert.equal((await service(resumed, {action: "status"})).url, state.url);
+  assert.match((await service(resumed, {action: "logs"})).output, /PREVIEW_READY/);
+  await service(resumed, {action: "stop"});
+  await assert.rejects(fetch(state.url));
+  assert.equal((await service(resumed, {action: "status"})).state, "stopped");
+  assert.equal(existsSync(join(project, "asset-write")), false);
+  assert.equal(readFileSync(outside, "utf8"), "host secret");
+});
+
+test("service startup rejects socket symlinks and never executes commands on the host", {skip: serviceSkip}, async t => {
+  cleanupService(t);
+  let connections = 0;
+  const secretSocket = join(agent, "host.sock"), server = socketServer(socket => { connections++; socket.end("SECRET"); });
+  await new Promise(resolve => server.listen(secretSocket, resolve));
+  t.after(() => new Promise(resolve => server.close(resolve)));
+  const client = await start(t);
+  writeFileSync(join(project, "link.ts"), `require('node:fs').symlinkSync(${JSON.stringify(secretSocket)},process.env.PI_WORK_SOCKET);setInterval(()=>{},1000);`);
+  await assert.rejects(service(client, {action: "start", command: "bun run link.ts"}), /Unix socket|file or link/);
+  assert.doesNotMatch(JSON.parse(readFileSync(servicePaths(project, agent).state, "utf8")).error, /^Error:/);
+  const failure = await client.command("/work run bun run link.ts", "pi-work:");
+  assert.match(failure, /^pi-work: PI_WORK_SOCKET/);
+  assert.equal(connections, 0);
+  await assert.rejects(service(client, {action: "start", command: `echo bad > '${visible}'`, preview: false}), /exited|stopped/);
+  assert.equal(readFileSync(visible, "utf8"), "read only");
+  await assert.rejects(service(client, {action: "start", command: "exit 7", preview: false}), /exited|stopped/);
+  assert.equal(await servicePlatform(project).active(servicePaths(project, agent).label), false);
+});
+
+test("service cancellation stops startup and a foreground worker can be restarted", {skip: serviceSkip}, async t => {
+  cleanupService(t);
+  const client = await start(t);
+  const command = `bun -e 'setInterval(()=>console.log("WORKING"),100)'`;
+  assert.match(await client.fixture({op: "cancel", tool: "work_service", params: {action: "start", command}}), /Abort|cancel/i);
+  assert.equal(await servicePlatform(project).active(servicePaths(project, agent).label), false);
+  assert.equal((await service(client, {action: "start", command, preview: false})).state, "running");
+  await assert.rejects(service(client, {action: "start", command}), /already running/);
+  await client.command("/work stop", "Service stopped.");
+  assert.equal((await service(client, {action: "status"})).state, "stopped");
+  await client.command("/work run --background " + command, "Service running.");
+  assert.match(await client.command("/work logs", "Service running."), /\nWORKING\n/);
+  await service(client, {action: "stop"});
+});
+
+test("preview path length fails before launch; workers do not need a socket", {skip: serviceSkip}, async t => {
+  const longAgent = join(root, "long-" + "x".repeat(100)); mkdirSync(longAgent);
+  writeFileSync(join(longAgent, "settings.json"), JSON.stringify(settings));
+  const paths = servicePaths(project, longAgent), backend = servicePlatform(project);
+  t.after(async () => {if (await backend.active(paths.label)) await backend.stop(paths.label);});
+  const client = await start(t, project, {environment: {...env, PI_CODING_AGENT_DIR: longAgent}});
+  await assert.rejects(service(client, {action: "start", command: "bun run server.ts"}), /Pi state path is too long/);
+  assert.equal(existsSync(paths.dir), false);
+  assert.equal(await backend.active(paths.label), false);
+  assert.match(await client.command("/work doctor", "pi-work\n"), /Pi state path is too long/);
+  await service(client, {action: "start", command: "sleep 60", preview: false});
+  await service(client, {action: "stop"});
+});
+
+test("logs stay bounded and saved services can be stopped after deleting their workspace", {skip: serviceSkip}, async t => {
+  cleanupService(t);
+  const client = await start(t), paths = servicePaths(project, agent);
+  writeFileSync(join(project, "noisy.ts"), `for(let i=0;i<512;i++)console.log('€'.repeat(4096));console.log('LATEST\\nplain logs');setInterval(()=>{},1000);`);
+  await service(client, {action: "start", command: "bun run noisy.ts", preview: false});
+  const deadline = Date.now() + 5000;
+  while (!readFileSync(paths.log, "utf8").includes("LATEST") && Date.now() < deadline)
+    await new Promise(resolve => setTimeout(resolve, 20));
+  assert.ok(statSync(paths.log).size <= 128000);
+  assert.doesNotThrow(() => new TextDecoder("utf-8", {fatal: true}).decode(readFileSync(paths.log)));
+  assert.match((await service(client, {action: "logs"})).output, /LATEST\nplain logs/);
+  await client.close();
+  rmSync(project, {recursive: true});
+  // Diagnostics and stop need no version probes. macOS still uses Bun for flock.
+  const bin = join(root, "broken-tools"); mkdirSync(bin);
+  for (const name of process.platform === "linux" ? ["bun", "node"] : ["node"])
+    writeFileSync(join(bin, name), "#!/bin/sh\nexit 99\n", {mode: 0o755});
+  const ordinary = await start(t, plain, {environment: {...env, PATH: bin + ":" + env.PATH}});
+  const broken = servicePaths(join(root, "bad-config"), agent);
+  mkdirSync(broken.dir); writeFileSync(broken.config, "broken JSON");
+  const listed = await ordinary.command("/work services", "Services\n");
+  assert.ok(listed.includes(project)); assert.ok(listed.includes(paths.label)); assert.match(listed, /Service running/);
+  assert.ok(listed.includes(broken.label)); assert.match(listed, /Invalid service configuration/);
+  assert.match(await ordinary.command("/work stop " + broken.label, "pi-work:"), /Invalid service configuration/);
+  await ordinary.command("/work stop " + paths.label, "Service stopped.");
+  assert.equal(await servicePlatform(project).active(paths.label), false);
+  assert.equal(JSON.parse(readFileSync(paths.state, "utf8")).state, "stopped");
+  assert.match(await ordinary.command("/work stop not-ours", "pi-work:"), /Unknown service ID/);
+  assert.ok(existsSync(join(paths.dir, "runtime")), "Stopping keeps private app data");
+});
+
+test("failed sandbox startup still reports and stops a running service", {skip: serviceSkip}, async t => {
+  cleanupService(t);
+  const client = await start(t);
+  await service(client, {action: "start", command: "sleep 60", preview: false});
+  await client.close();
+  const marker = readFileSync(join(project, ".pi-work"));
+  writeFileSync(join(project, ".pi-work"), "broken JSON");
+  const invalid = await start(t);
+  const invalidStatus = await invalid.command("/work", "pi-work\n");
+  assert.match(invalidStatus, /sandbox    Invalid .pi-work JSON/);
+  assert.match(invalidStatus, /workspace  invalid marker/);
+  assert.match(invalidStatus, /service    running/);
+  await invalid.close();
+  writeFileSync(join(project, ".pi-work"), marker);
+  const bin = join(root, "missing-flock"); mkdirSync(bin);
+  // Keep only the native supervisor on PATH. Pi itself is launched by absolute path.
+  const names = process.platform === "linux" ? ["systemctl", "systemd-run"] : ["launchctl", "bun"];
+  for (const name of names) {
+    const path = env.PATH.split(":").map(dir => join(dir, name)).find(existsSync);
+    symlinkSync(realpathSync(path), join(bin, name));
+  }
+  const failed = await start(t, project, {environment: {...env, PATH: bin}});
+  const status = await failed.command("/work", "pi-work\n");
+  assert.match(status, /sandbox    Missing (bun|node)/);
+  assert.match(status, /service    running/);
+  await failed.command("/work stop", "Service stopped.");
+  assert.equal(await servicePlatform(project).active(servicePaths(project, agent).label), false);
+});
+
+test("the service runner checks the installed Pi version", {skip: serviceSkip}, async t => {
+  cleanupService(t);
+  const packageDir = join(root, "changed-pi"); mkdirSync(packageDir);
+  writeFileSync(join(packageDir, "package.json"), JSON.stringify({version: "1.0.5"}));
+  const host = {version: "1.0.4", agentDir: agent, packageDir};
+  await assert.rejects(serviceAction(project, host, {action: "start", command: "sleep 60", preview: false}), /^Error: Pi 1\.0\.4 required\.$/);
+  assert.equal(JSON.parse(readFileSync(servicePaths(project, agent).state, "utf8")).error, "Pi 1.0.4 required.");
+});
+
+test("service crashes are reported and supervisor stop kills descendants", {skip: serviceSkip}, async t => {
+  cleanupService(t);
+  const client = await start(t), paths = servicePaths(project, agent);
+  writeFileSync(join(project, "crash.ts"), `Bun.serve({unix:process.env.PI_WORK_SOCKET,fetch(req){if(new URL(req.url).pathname==='/crash')setTimeout(()=>process.exit(7),10);return new Response('OK');}});`);
+  const state = await service(client, {action: "start", command: "bun run crash.ts"});
+  await fetch(state.url + "/crash");
+  const deadline = Date.now() + 5000;
+  let failed;
+  do {
+    await new Promise(resolve => setTimeout(resolve, 50));
+    failed = await service(client, {action: "status"});
+  } while (failed.state === "running" && Date.now() < deadline);
+  assert.equal(failed.state, "failed"); assert.match(failed.error, /code 7/);
+  writeFileSync(join(project, "worker.ts"), `Bun.spawn(['bun','-e',\`setInterval(()=>require('fs').appendFileSync(process.env.XDG_DATA_HOME+'/ticks','x'),50)\`],{stdio:['ignore','ignore','ignore']});setInterval(()=>{},1000);`);
+  await service(client, {action: "start", command: "bun run worker.ts", preview: false});
+  const ticks = join(paths.dir, "runtime/data/ticks");
+  assert.ok(readFileSync(ticks).length > 0);
+  await service(client, {action: "stop"});
+  const final = readFileSync(ticks, "utf8");
+  await new Promise(resolve => setTimeout(resolve, 200));
+  assert.equal(readFileSync(ticks, "utf8"), final);
+});
+
+test("missing service supervision explains the limitation while ordinary tools work", async t => {
+  const bin = join(root, "no-supervisor"); mkdirSync(bin);
+  for (const name of ["systemctl", "systemd-run", "launchctl"])
+    writeFileSync(join(bin, name), "#!/bin/sh\nexit 1\n", {mode: 0o755});
+  const client = await start(t, project, {environment: {...env, PATH: bin + ":" + env.PATH}});
+  await assert.rejects(service(client, {action: "start", command: "bun run server.ts"}), /need a.*(systemd|launchd)/);
+  const doctor = await client.command("/work doctor", "pi-work\n");
+  assert.match(doctor, /no unsandboxed fallback/);
+  assert.equal((await client.bash("echo STILL_WORKS")).output.trim(), "STILL_WORKS");
+});

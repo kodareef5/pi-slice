@@ -1,0 +1,56 @@
+{
+  "name": "pi-work",
+  "version": "0.1.0",
+  "description": "Opt-in workspace isolation for ordinary Pi sessions",
+  "type": "module",
+  "keywords": [
+    "pi-package"
+  ],
+  "pi": {
+    "extensions": [
+      "./extension.ts"
+    ]
+  },
+  "files": [
+    "extension.ts",
+    "workspace.ts",
+    "process.ts",
+    "sandbox.ts",
+    "features/",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@anthropic-ai/sandbox-runtime": "0.0.78",
+    "tar": "7.5.22"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "1.0.4",
+    "@earendil-works/pi-coding-agent": "1.0.4"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-ai": {
+      "optional": true
+    },
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    }
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/kodareef5/pi-work.git"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "1.0.4",
+    "@earendil-works/pi-coding-agent": "1.0.4",
+    "@types/node": "24.19.1",
+    "typescript": "7.0.2"
+  }
+}

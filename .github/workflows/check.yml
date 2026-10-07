@@ -1,0 +1,36 @@
+name: Check
+on: [push, pull_request]
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        node: [24, 26]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap socat ripgrep age dbus-user-session
+      - name: Start Linux user service manager
+        if: runner.os == 'Linux'
+        run: |
+          runner_uid=$(id -u)
+          sudo systemctl start "user@${runner_uid}.service"
+          export XDG_RUNTIME_DIR="/run/user/${runner_uid}"
+          export DBUS_SESSION_BUS_ADDRESS="unix:path=${XDG_RUNTIME_DIR}/bus"
+          systemctl --user show-environment >/dev/null
+          echo "XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR}" >> "$GITHUB_ENV"
+          echo "DBUS_SESSION_BUS_ADDRESS=${DBUS_SESSION_BUS_ADDRESS}" >> "$GITHUB_ENV"
+          echo "PI_WORK_REQUIRE_SERVICES=1" >> "$GITHUB_ENV"
+      - if: runner.os == 'macOS'
+        run: brew install ripgrep age
+      - run: npm ci --ignore-scripts
+      - run: npm run typecheck
+      - run: npm test
