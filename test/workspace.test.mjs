@@ -9,10 +9,10 @@ import { randomUUID } from "node:crypto";
 import { staging } from "../workspace.ts";
 
 test("staging reclaims confirmed dead owners and preserves live or unknown owners", async (t) => {
-  const agent = mkdtempSync(join(tmpdir(), "pi-work-stage-"));
+  const agent = mkdtempSync(join(tmpdir(), "pi-slice-stage-"));
   t.after(() => rmSync(agent, { recursive: true, force: true }));
   const live = staging(agent),
-    base = join(agent, "pi-work/staging");
+    base = join(agent, "pi-slice/staging");
   const child = spawn(process.execPath, ["-e", "process.exit(0)"]);
   await once(child, "exit");
   const dead = join(base, `${child.pid}-${randomUUID()}-abcdef`),

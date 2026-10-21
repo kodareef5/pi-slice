@@ -1,5 +1,5 @@
 // Exercise Pi's registered tools without making model requests.
-import work from "../extension.ts";
+import slice from "../extension.ts";
 import { getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -8,7 +8,7 @@ import { executable, staging } from "../workspace.ts";
 export default function driver(pi: ExtensionAPI) {
   const tools = new Map(),
     gates: any[] = [];
-  work({
+  slice({
     ...pi,
     registerTool(tool) {
       tools.set(tool.name, tool);
@@ -31,7 +31,7 @@ export default function driver(pi: ExtensionAPI) {
             processCwd: process.cwd(),
             agent: getAgentDir(),
             home: process.env.HOME,
-            secret: process.env.PI_WORK_TEST_SECRET === "fixture",
+            secret: process.env.PI_SLICE_TEST_SECRET === "fixture",
             umask: process.umask(),
             tools: pi.getActiveTools(),
             overridden: [...tools.keys()],

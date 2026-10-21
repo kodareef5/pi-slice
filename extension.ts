@@ -17,11 +17,11 @@ import { savedServices, serviceAction, serviceStatus, serviceText, socketPrefix 
 import { servicePlatform } from "./features/service-platform.ts";
 
 const packageRoot = import.meta.dirname;
-const toolNames = ["read", "bash", "edit", "write", "work_service"];
+const toolNames = ["read", "bash", "edit", "write", "slice_service"];
 const piHost = () => ({ version: VERSION, agentDir: getAgentDir(), packageDir: getPackageDir() });
 const requirements = (cwd: string) => inspectRequirements(cwd, piHost());
 
-const marked = (cwd: string) => present(join(cwd, ".pi-work"));
+const marked = (cwd: string) => present(join(cwd, ".pi-slice"));
 
 function imageType(data: Buffer) {
   const hex = data.subarray(0, 8).toString("hex"),
@@ -34,7 +34,7 @@ function imageType(data: Buffer) {
   return null;
 }
 
-export default function work(pi: ExtensionAPI) {
+export default function slice(pi: ExtensionAPI) {
   let ready = false,
     root = "",
     failure = "Sandbox is not ready.",
@@ -47,33 +47,33 @@ export default function work(pi: ExtensionAPI) {
   const protectedContext = (ctx: ExtensionContext) => !!root || marked(ctx.cwd);
   const check = (ctx: ExtensionContext) => {
     if (!ready || realpathSync(ctx.cwd) !== root)
-      throw Error(`pi-work: ${ready ? "Workspace changed; restart Pi." : failure}`);
+      throw Error(`pi-slice: ${ready ? "Workspace changed; restart Pi." : failure}`);
   };
   pi.on("project_trust", (_event, ctx) => ({ trusted: marked(ctx.cwd) ? "no" : "undecided" }));
   pi.on("before_agent_start", (event, ctx) => {
     if (!ready || realpathSync(ctx.cwd) !== root) return;
-    event.systemPromptOptions.sections.pi_work = `You are in a pi-work workspace: ${root}.
+    event.systemPromptOptions.sections.pi_slice = `You are in a Pi Slice workspace: ${root}.
 Pi keeps normal auth and sessions. Your read, bash, edit and write tools run inside an OS sandbox.
 Bash, Bun (including TypeScript and bun:sqlite), Node/npm (including node:sqlite), Git and rg are available. Check other tools such as Python before relying on them.
 Default to Bun and TypeScript for new scripts and web projects: Bun.serve, Bun.file, bun run and bun add when dependencies are needed. Follow an existing project's stack or the user's preference.
 Match the requested scope. A basic HTML dashboard usually needs only index.html and a tiny server.ts, without framework scaffolding, custom APIs or a test harness. Inspect relevant project files; skip routine host/tool inventories. Do not assume Git is initialized.${process.platform === "darwin" ? " On macOS, new Git repositories must be initialized by the user in the host terminal; protected hooks/config prevent sandboxed git init. Git add/commit work for existing repositories." : ""}
 Project secrets remain readable; writes are limited to the workspace. Homes and Pi state are hidden; other host paths are generally read-only. Internet and local/LAN services are reachable through proxies. Linux permits Unix sockets on visible paths.
 HOME, caches and scratch files live under .pi-runtime. ${process.platform === "linux" ? "Background processes end with each shell command; run a server and its checks in the same command. Sandbox localhost is separate from the host browser." : "Local network binding is restricted."} Use git add <paths>; sandbox placeholders can break git add -A.
-Use work_service to start, inspect, read logs or stop one background service for this workspace when the user asks. It survives Pi/terminal exit, using systemd on Linux or launchd on macOS; unsupported hosts get an explanation. No automatic restart after reboot.
-For a browser preview, configure Bun.serve({ unix: process.env.PI_WORK_SOCKET, fetch }) and call work_service with action:"start", command:"bun run server.ts". Return its localhost URL. Use preview:false for a worker. Keep the command in the foreground; do not use &, nohup or PM2. Starting the service is enough; the user need not keep a terminal open.
+Use slice_service to start, inspect, read logs or stop one background service for this workspace when the user asks. It survives Pi/terminal exit, using systemd on Linux or launchd on macOS; unsupported hosts get an explanation. No automatic restart after reboot.
+For a browser preview, configure Bun.serve({ unix: process.env.PI_SLICE_SOCKET, fetch }) and call slice_service with action:"start", command:"bun run server.ts". Return its localhost URL. Use preview:false for a worker. Keep the command in the foreground; do not use &, nohup or PM2. Starting the service is enough; the user need not keep a terminal open.
 Background services read project files but write only to their private HOME/cache/TMPDIR/XDG_DATA_HOME. Install dependencies and build assets with normal tools first. Service runtime data stays on this machine and is not exported. Existing service code changes may need stop/start. Do not bypass an unavailable supervisor by running project code unsandboxed.
 These are user commands entered in Pi, not shell commands:
-/work — status; /work doctor — requirements and diagnostics; /work init [new] — initialize (new resets identity; first setup exits Pi for restart).
-/work export [file.piw] — encrypted assets and Git, excluding runtime/dependencies; no Pi account or conversation collection.
-/work import <file.piw> <new-directory> — restore assets with a fresh workspace ID. Both transfer commands require the user's interactive password prompt.
-/work run <command> — start a Unix-socket preview; /work run --background <command> — start a worker; /work logs and /work stop — service controls.
-/work services — user-only inventory; /work stop <service-id> also works from unmarked Pi to stop a deleted workspace's service.
-You can build and test TypeScript/Bun dashboards. Cloudflare publishing or sharing needs a separate authenticated setup; pi-work provides no deployment or sharing command. Guide the user through host-side authentication without copying credentials into the workspace.
-Pi documentation and skill paths listed elsewhere may be hidden. Use this section for pi-work help instead of searching host directories.`;
+/slice — status; /slice doctor — requirements and diagnostics; /slice init [new] — initialize (new resets identity; first setup exits Pi for restart).
+/slice export [file.slice] — encrypted assets and Git, excluding runtime/dependencies; no Pi account or conversation collection.
+/slice import <file.slice> <new-directory> — restore assets with a fresh workspace ID. Both transfer commands require the user's interactive password prompt.
+/slice run <command> — start a Unix-socket preview; /slice run --background <command> — start a worker; /slice logs and /slice stop — service controls.
+/slice services — user-only inventory; /slice stop <service-id> also works from unmarked Pi to stop a deleted workspace's service.
+You can build and test TypeScript/Bun dashboards. Cloudflare publishing or sharing needs a separate authenticated setup; Pi Slice provides no deployment or sharing command. Guide the user through host-side authentication without copying credentials into the workspace.
+Pi documentation and skill paths listed elsewhere may be hidden. Use this section for Pi Slice help instead of searching host directories.`;
   });
   pi.on("tool_call", (event, ctx) => {
     if (protectedContext(ctx) && (!ready || !toolNames.includes(event.toolName) || realpathSync(ctx.cwd) !== root))
-      return { block: true, reason: `pi-work: ${ready ? "Only read, bash, edit, write and work_service are allowed." : failure}` };
+      return { block: true, reason: `pi-slice: ${ready ? "Only read, bash, edit, write and slice_service are allowed." : failure}` };
   });
   pi.on("user_bash", (_event, ctx) => {
     if (!protectedContext(ctx)) return;
@@ -187,7 +187,7 @@ Pi documentation and skill paths listed elsewhere may be hidden. Use this sectio
         },
         timeout: 10,
       });
-      if (probe.exitCode !== 0 || output.trim() !== "PI_WORK_OK")
+      if (probe.exitCode !== 0 || output.trim() !== "PI_SLICE_OK")
         throw Error("Sandbox startup probe failed. " + output.slice(-1200));
 
       // File I/O runs inside the sandbox. JSON stdin keeps file contents out of shell arguments.
@@ -229,14 +229,14 @@ if(Buffer.isBuffer(result))process.stdout.write(result);
           },
         });
       pi.registerTool({
-        name: "work_service",
+        name: "slice_service",
         label: "Workspace service",
-        description: "Manage this workspace's sandboxed background service. Start only when the user asks to run/host an app or worker. Preview apps must listen on the Unix socket in PI_WORK_SOCKET; Bun.serve({unix: process.env.PI_WORK_SOCKET, fetch}) works. Project code is read-only; HOME, TMPDIR and XDG_DATA_HOME are writable private runtime. Use preview:false for workers. No host commands or credentials are exposed.",
+        description: "Manage this workspace's sandboxed background service. Start only when the user asks to run/host an app or worker. Preview apps must listen on the Unix socket in PI_SLICE_SOCKET; Bun.serve({unix: process.env.PI_SLICE_SOCKET, fetch}) works. Project code is read-only; HOME, TMPDIR and XDG_DATA_HOME are writable private runtime. Use preview:false for workers. No host commands or credentials are exposed.",
         promptSnippet: "Start, inspect, read logs or stop a sandboxed service that survives Pi exiting.",
         parameters: Type.Object({
           action: Type.Union([Type.Literal("start"), Type.Literal("status"), Type.Literal("logs"), Type.Literal("stop")]),
           command: Type.Optional(Type.String({description: "Foreground shell command; required to start."})),
-          preview: Type.Optional(Type.Boolean({description: "Default true: expose a localhost HTTP preview via PI_WORK_SOCKET. False for a worker."})),
+          preview: Type.Optional(Type.Boolean({description: "Default true: expose a localhost HTTP preview via PI_SLICE_SOCKET. False for a worker."})),
         }),
         async execute(_id, params, signal, _update, ctx) {
           check(ctx);
@@ -246,16 +246,16 @@ if(Buffer.isBuffer(result))process.stdout.write(result);
       });
       pi.setActiveTools(toolNames);
       ready = true;
-      ctx.ui.setStatus("pi-work", "🔒 pi-work · " + root);
+      ctx.ui.setStatus("pi-slice", "🔒 Pi Slice · " + root);
     } catch (error) {
       ready = false;
       failure = error instanceof Error ? error.message : String(error);
-      ctx.ui.setStatus("pi-work", "⛔ pi-work · tools blocked");
-      ctx.ui.notify(`pi-work: ${failure} Tools are blocked. Run /work doctor.`, "error");
+      ctx.ui.setStatus("pi-slice", "⛔ Pi Slice · tools blocked");
+      ctx.ui.notify(`pi-slice: ${failure} Tools are blocked. Run /slice doctor.`, "error");
     }
   });
 
-  pi.registerCommand("work", {
+  pi.registerCommand("slice", {
     description: "Workspace status, init, doctor, run, logs, stop, services, export, import",
     async handler(args, ctx) {
       try {
@@ -270,14 +270,14 @@ if(Buffer.isBuffer(result))process.stdout.write(result);
         const [command = "", ...values] = words.map(word => word.replace(/^["']|["']$/g, ""));
         const limits: Record<string, number> = { "": 0, init: 1, doctor: 0, logs: 0, stop: 1, services: 0, export: 1, import: 2 };
         if (!Object.hasOwn(limits, command) || values.length > limits[command])
-          throw Error("Use /work, init [new], doctor, run [--background] <command>, logs, stop [service-id], services, export [file.piw], or import <file.piw> <new-directory>.");
+          throw Error("Use /slice, init [new], doctor, run [--background] <command>, logs, stop [service-id], services, export [file.slice], or import <file.slice> <new-directory>.");
         if (command === "services" || (command === "stop" && values.length)) {
           const saved = await savedServices(piHost());
           if (command === "services") {
             ctx.ui.notify("Services\n" + (saved.map(s => `${s.label}\n${s.root || "Workspace unavailable"}\n${serviceText(s)}`).join("\n\n") || "None saved."), "info");
           } else {
             const service = saved.find(s => s.label === values[0]);
-            if (!service) throw Error("Unknown service ID. Use /work services.");
+            if (!service) throw Error("Unknown service ID. Use /slice services.");
             if (!service.root) throw Error(service.error);
             ctx.ui.notify(serviceText(await serviceAction(service.root, piHost(), {action: "stop"}, ctx.signal)), "info");
           }
@@ -293,11 +293,11 @@ if(Buffer.isBuffer(result))process.stdout.write(result);
           let identity = isMarked ? "invalid marker" : "unmarked";
           // A broken marker must not hide a still-running service.
           if (isMarked) { try { identity = readWorkspace(ctx.cwd).id; } catch {} }
-          const status = ready ? "healthy" : protectedContext(ctx) ? failure : "off; run /work init";
+          const status = ready ? "healthy" : protectedContext(ctx) ? failure : "off; run /slice init";
           const available = (name: string) => {
             try { executable(name, ctx.cwd); return "available"; } catch { return "missing"; }
           };
-          let text = `pi-work\nsandbox    ${status}\nworkspace  ${identity}\nruntime    ${runtime}\nexport     age ${available("age")}; tar ${available("tar")}`;
+          let text = `pi-slice\nsandbox    ${status}\nworkspace  ${identity}\nruntime    ${runtime}\nexport     age ${available("age")}; tar ${available("tar")}`;
           if (ready || isMarked) {
             const service = await serviceStatus(realpathSync(ctx.cwd), piHost());
             text += `\nservice    ${service.state}${service.url ? " · " + service.url : ""}${service.error ? " · " + service.error : ""}`;
@@ -317,7 +317,7 @@ if(Buffer.isBuffer(result))process.stdout.write(result);
           return;
         }
         if (command === "import") {
-          if (values.length !== 2) throw Error("Use /work import <file.piw> <new-directory>.");
+          if (values.length !== 2) throw Error("Use /slice import <file.slice> <new-directory>.");
           const cwd = realpathSync(ctx.cwd), path = resolvePath(cwd, values[1]);
           const destination = join(realpathSync(dirname(path)), basename(path));
           for (const trusted of [getAgentDir(), getPackageDir(), packageRoot, ...(marked(cwd) ? [cwd] : [])]) {
@@ -330,7 +330,7 @@ if(Buffer.isBuffer(result))process.stdout.write(result);
         }
         const found = requirements(ctx.cwd);
         if (command === "init") {
-          if (values[0] && values[0] !== "new") throw Error("Use /work init [new].");
+          if (values[0] && values[0] !== "new") throw Error("Use /slice init [new].");
           const existing = marked(found.root);
           if (existing) readWorkspace(found.root);
           await (lock || commandLock(getAgentDir(), found.root, found.tools.flock,
@@ -359,7 +359,7 @@ if(Buffer.isBuffer(result))process.stdout.write(result);
         );
         ctx.ui.notify("Saved " + file, "info");
       } catch (error) {
-        ctx.ui.notify(`pi-work: ${error instanceof Error ? error.message : error}`, "error");
+        ctx.ui.notify(`pi-slice: ${error instanceof Error ? error.message : error}`, "error");
       }
     },
   });

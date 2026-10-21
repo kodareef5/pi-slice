@@ -16,7 +16,7 @@ export function serviceText(state: ServiceState & {output?: string}) {
 }
 
 export function socketPrefix(agent: string) {
-  const prefix = join(realpathSync(agent), "pi-work/sockets/s-");
+  const prefix = join(realpathSync(agent), "pi-slice/sockets/s-");
   // mkdtemp adds six characters; leave room for the socket name on both OSes.
   if (Buffer.byteLength(prefix + "XXXXXX/in/app") > 100)
     throw Error("Pi state path is too long for a preview socket. Use a shorter PI_CODING_AGENT_DIR.");
@@ -31,8 +31,8 @@ export function record(path: string, value: unknown) {
 }
 
 export function servicePaths(root: string, agent: string) {
-  const label = "pi-work-" + createHash("sha256").update(root).digest("hex").slice(0, 24);
-  const dir = join(agent, "pi-work/services", label);
+  const label = "pi-slice-" + createHash("sha256").update(root).digest("hex").slice(0, 24);
+  const dir = join(agent, "pi-slice/services", label);
   return {label, dir, state: join(dir, "state.json"), log: join(dir, "output.log"), config: join(dir, "config.json")};
 }
 
@@ -52,11 +52,11 @@ export async function serviceStatus(root: string, pi: PiHost): Promise<ServiceSt
 
 // User-only inventory. The model tool remains limited to its current workspace.
 export async function savedServices(pi: PiHost) {
-  const dir = join(pi.agentDir, "pi-work/services");
+  const dir = join(pi.agentDir, "pi-slice/services");
   if (!existsSync(dir)) return [];
   const services: (ServiceState & {label: string; root?: string})[] = [];
   for (const entry of readdirSync(dir, {withFileTypes: true})) {
-    if (!entry.isDirectory() || !/^pi-work-[0-9a-f]{24}$/.test(entry.name)) continue;
+    if (!entry.isDirectory() || !/^pi-slice-[0-9a-f]{24}$/.test(entry.name)) continue;
     try {
       const config: ServiceConfig = JSON.parse(readFileSync(join(dir, entry.name, "config.json"), "utf8"));
       if (!isAbsolute(config.root) || servicePaths(config.root, pi.agentDir).label !== entry.name)
@@ -125,11 +125,11 @@ export async function serviceAction(root: string, pi: PiHost, request: ServiceRe
         signal?.throwIfAborted();
         const state = readState(paths.state);
         if (state.state === "running") return state;
-        if (state.state === "failed" || state.state === "stopped") throw Error(state.error || "Service exited before it was ready. Check /work logs.");
-        if (!await backend.active(paths.label)) throw Error("Service supervisor could not keep the runner alive. Check /work logs.");
+        if (state.state === "failed" || state.state === "stopped") throw Error(state.error || "Service exited before it was ready. Check /slice logs.");
+        if (!await backend.active(paths.label)) throw Error("Service supervisor could not keep the runner alive. Check /slice logs.");
         await new Promise(resolve => setTimeout(resolve, 100));
       }
-      throw Error("Service startup timed out. Preview servers must listen on the Unix socket in PI_WORK_SOCKET; use preview:false for a worker.");
+      throw Error("Service startup timed out. Preview servers must listen on the Unix socket in PI_SLICE_SOCKET; use preview:false for a worker.");
     } catch (error) {
       // A timed-out supervisor call may already have started the job.
       await backend.stop(paths.label).catch(() => {});

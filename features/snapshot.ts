@@ -14,7 +14,7 @@ import { executable, ignoreRuntime, inside, quote, readWorkspace, resolvePath, s
 export function captureCommand(bun: string) {
   const list = `const fs=require('node:fs'),p=require('node:path'),root=process.cwd();
 function walk(dir){for(const e of fs.readdirSync(dir,{withFileTypes:true})){
-if(['.pi-runtime','node_modules'].includes(e.name)||e.name.endsWith('.piw'))continue;
+if(['.pi-runtime','node_modules'].includes(e.name)||e.name.endsWith('.slice'))continue;
 const path=p.join(dir,e.name),s=fs.lstatSync(path);if(s.isSymbolicLink()){const link=fs.readlinkSync(path);if(p.isAbsolute(link))throw Error('Absolute symlink: '+path+'. Use a relative project link.');const target=p.resolve(p.dirname(path),link);if(target!==root&&!target.startsWith(root+'/'))continue;}
 else if(!s.isDirectory()&&!s.isFile())continue;
 process.stdout.write(path+'\\0');if(s.isDirectory())walk(path);}}walk('.');`;
@@ -125,13 +125,13 @@ export async function snapshot(
   capture: (command: string, file: string) => Promise<void>, output?: string,
 ) {
   if (ctx.mode !== "tui") throw Error("Snapshots need interactive Pi for age's masked password prompt.");
-  const age = executable("age", ctx.cwd), target = resolvePath(ctx.cwd, output || join("..", basename(ctx.cwd) + ".piw"));
+  const age = executable("age", ctx.cwd), target = resolvePath(ctx.cwd, output || join("..", basename(ctx.cwd) + ".slice"));
   if (inside(join(realpathSync(dirname(target)), basename(target)), realpathSync(ctx.cwd)))
     throw Error("Save snapshots outside the workspace.");
   if (lstatSync(target, { throwIfNoEntry: false })) throw Error("Choose a new snapshot file.");
   const temp = staging(agent);
   try {
-    const contents = join(temp, "workspace.tar"), encrypted = join(temp, "snapshot.piw");
+    const contents = join(temp, "workspace.tar"), encrypted = join(temp, "snapshot.slice");
     await capture(captureCommand(bun), contents);
     // Catch links changed during capture before reporting a successful export.
     await validate(contents);

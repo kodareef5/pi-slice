@@ -27,7 +27,7 @@ export function servicePlatform(root: string, platform = process.platform) {
     name: "systemd user service",
     async check() {
       try { await run("systemctl", ["--user", "show-environment"]); executable("systemd-run", root); }
-      catch { throw Error("Background services need a running systemd user manager on Linux. This host has none available. Ordinary pi-work tools still work; no unsandboxed fallback is used. Use a systemd user session or a future alternative backend."); }
+      catch { throw Error("Background services need a running systemd user manager on Linux. This host has none available. Pi Slice tools still work; no unsandboxed fallback is used. Use a systemd user session or a future alternative backend."); }
     },
     async active(label: string) {
       try { return /^(active|activating|deactivating)$/.test((await run("systemctl", ["--user", "show", label, "--property=ActiveState", "--value"])).trim()); }
@@ -45,7 +45,7 @@ export function servicePlatform(root: string, platform = process.platform) {
       name: "launchd agent",
       async check() {
         try { await run("launchctl", ["print", domain]); }
-        catch { throw Error("Background services need a logged-in macOS launchd user session. Ordinary pi-work tools still work; no unsandboxed fallback is used."); }
+        catch { throw Error("Background services need a logged-in macOS launchd user session. Pi Slice tools still work; no unsandboxed fallback is used."); }
       },
       async active(label: string) {
         try {

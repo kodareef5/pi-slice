@@ -140,14 +140,14 @@ try {
     settings.filesystem.allowRead.push(inbox);
     settings.filesystem.allowWrite.push(inbox);
     settings.network.allowUnixSockets = [inbox];
-    env.PI_WORK_SOCKET = appSocket;
+    env.PI_SLICE_SOCKET = appSocket;
   }
   // Mandatory deny placeholders belong only to this private runtime. Pi's
   // command cleanup cannot remove them; the project itself is read-only here.
   process.chdir(runtime);
   await manager.initialize(settings);
   initialized = true;
-  const readonlyProbe = `const fs=require('node:fs'),assert=require('node:assert/strict');assert.throws(()=>fs.writeFileSync(${JSON.stringify(join(found.root, ".pi-work-service-probe"))},'bad'),e=>['EPERM','EACCES','EROFS'].includes(e.code));`;
+  const readonlyProbe = `const fs=require('node:fs'),assert=require('node:assert/strict');assert.throws(()=>fs.writeFileSync(${JSON.stringify(join(found.root, ".pi-slice-service-probe"))},'bad'),e=>['EPERM','EACCES','EROFS'].includes(e.code));`;
   const probe = probeCode(env, found.nodeVersion, config.pi.agentDir);
   if (await (await launch(`${quote(found.tools.bun)} --no-env-file --config=/dev/null -e ${quote(probe)} && ${quote(found.tools.bun)} --no-env-file --config=/dev/null -e ${quote(readonlyProbe)}`, env)).done !== 0)
     throw Error("Background sandbox startup probe failed. " + logTail());
@@ -161,7 +161,7 @@ try {
   const deadline = Date.now() + 15000;
   while (!ended && !ending) {
     if (!config.preview || lstatSync(appSocket, {throwIfNoEntry: false})) break;
-    if (Date.now() >= deadline) throw Error("Preview must listen on PI_WORK_SOCKET (Bun.serve({ unix: process.env.PI_WORK_SOCKET, fetch })). Use preview:false for a worker.");
+    if (Date.now() >= deadline) throw Error("Preview must listen on PI_SLICE_SOCKET (Bun.serve({ unix: process.env.PI_SLICE_SOCKET, fetch })). Use preview:false for a worker.");
     await new Promise(resolve => setTimeout(resolve, 50));
   }
   if (ended || ending) throw Error("Service exited before startup completed. " + logTail());
@@ -170,7 +170,7 @@ try {
     // Move the socket into a directory the app cannot write, then validate it.
     // Never make host connections through an app-controlled path or symlink.
     renameSync(appSocket, backend);
-    if (!lstatSync(backend).isSocket()) throw Error("PI_WORK_SOCKET must be a Unix socket, not a file or link.");
+    if (!lstatSync(backend).isSocket()) throw Error("PI_SLICE_SOCKET must be a Unix socket, not a file or link.");
     forward(backend);
     await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", resolve); });
     url = `http://127.0.0.1:${(server.address() as {port: number}).port}`;
@@ -183,7 +183,7 @@ try {
   if (ended || ending) throw Error("The foreground service command stopped during startup.");
   record(paths.state, {state: "running", command: config.command, ...(url ? {url} : {})});
   const code = await done;
-  await finish(code ? "Service exited with code " + code + ". Check /work logs." : undefined);
+  await finish(code ? "Service exited with code " + code + ". Check /slice logs." : undefined);
 } catch (error) {
   const message = error instanceof Error ? error.message : String(error);
   note(message + "\n");

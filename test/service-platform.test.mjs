@@ -7,7 +7,7 @@ import {servicePlatform} from "../features/service-platform.ts";
 import {record, serviceAction, servicePaths} from "../features/service.ts";
 
 test("native supervisors receive literal arguments, bounded shutdown and no automatic restart", async t => {
-  const base = mkdtempSync(join(tmpdir(), "pi-work-backend-")), bin = join(base, "bin"), log = join(base, "calls"), status = join(base, "status");
+  const base = mkdtempSync(join(tmpdir(), "pi-slice-backend-")), bin = join(base, "bin"), log = join(base, "calls"), status = join(base, "status");
   mkdirSync(bin);
   writeFileSync(status, "state = running");
   const path = process.env.PATH;
@@ -24,15 +24,15 @@ console.log(fs.readFileSync(status,'utf8'));` : `console.log(${JSON.stringify(na
   for (const platform of ["linux", "darwin"]) {
     const backend = servicePlatform(join(base, "project"), platform);
     await backend.check();
-    assert.equal(await backend.active("pi-work-test"), true);
+    assert.equal(await backend.active("pi-slice-test"), true);
     if (platform === "darwin") {
       writeFileSync(status, "state = xpcproxy\npid = 12345\n");
-      assert.equal(await backend.active("pi-work-test"), true);
+      assert.equal(await backend.active("pi-slice-test"), true);
       writeFileSync(status, "state = waiting\nruns = 1\nlast exit code = 0\n");
-      assert.equal(await backend.active("pi-work-test"), false);
+      assert.equal(await backend.active("pi-slice-test"), false);
     }
-    await backend.start("pi-work-test", args, base);
-    await backend.stop("pi-work-test");
+    await backend.start("pi-slice-test", args, base);
+    await backend.stop("pi-slice-test");
   }
   const calls = readFileSync(log, "utf8").trim().split("\n").map(JSON.parse);
   const run = calls.find(args => args.includes("--collect"));
@@ -41,7 +41,7 @@ console.log(fs.readFileSync(status,'utf8'));` : `console.log(${JSON.stringify(na
   assert.ok(run.includes("--property=TimeoutStopSec=8"));
   assert.equal(run.some(arg => /Restart=/.test(arg)), false);
   assert.ok(calls.some(args => args[0] === "bootstrap" && args[1] === "gui/" + process.getuid()));
-  assert.ok(calls.some(args => args[0] === "bootout" && args[1].endsWith("/pi-work-test")));
+  assert.ok(calls.some(args => args[0] === "bootout" && args[1].endsWith("/pi-slice-test")));
   const plist = readFileSync(join(base, "agent.plist"), "utf8");
   assert.match(plist, /<key>KeepAlive<\/key><false\/>/);
   assert.match(plist, /<key>ExitTimeOut<\/key><integer>8<\/integer>/);
@@ -52,7 +52,7 @@ console.log(fs.readFileSync(status,'utf8'));` : `console.log(${JSON.stringify(na
 });
 
 test("status and logs do not need a workspace or runtime executables", async t => {
-  const agent = mkdtempSync(join(tmpdir(), "pi-work-status-")), root = join(agent, "missing-project");
+  const agent = mkdtempSync(join(tmpdir(), "pi-slice-status-")), root = join(agent, "missing-project");
   const paths = servicePaths(root, agent), previous = process.env.PATH;
   t.after(() => {process.env.PATH = previous; rmSync(agent, {recursive: true, force: true});});
   mkdirSync(paths.dir, {recursive: true});

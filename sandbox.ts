@@ -21,7 +21,9 @@ export type PiHost = { version: string; agentDir: string; packageDir: string };
 
 export function requirements(cwd: string, pi: PiHost) {
   if (!["linux", "darwin"].includes(process.platform)) throw Error("Use macOS or Linux (Windows requires WSL).");
-  if (pi.version !== "1.0.4") throw Error("Pi 1.0.4 required.");
+  const piVersion = /^(\d+)\.(\d+)\.(\d+)$/.exec(pi.version);
+  if (!piVersion || Number(piVersion[1]) < 1 || (Number(piVersion[1]) === 1 && Number(piVersion[2]) < 4))
+    throw Error("Pi 1.4.0 or newer required.");
   const root = realpathSync(cwd);
   if (inside(realpathSync(homedir()), root))
     throw Error("Choose a workspace below your home, not your home or a parent directory.");
@@ -58,7 +60,7 @@ export function requirements(cwd: string, pi: PiHost) {
     return text;
   };
   const nodeVersion = version("node", [24, 0, 0]),
-    bunVersion = version("bun", [1, 4, 2]);
+    bunVersion = version("bun", [1, 4, 3]);
   if (Number(process.versions.node.split(".")[0]) < 24) throw Error("Run Pi with Node >=24.0.0.");
   const runtimeVersion = JSON.parse(
     readFileSync(require.resolve("@anthropic-ai/sandbox-runtime/package.json"), "utf8"),
@@ -134,7 +136,7 @@ export function policy(root: string, tools: Record<string, string>, agentDir: st
       allowRead: [root, ...Object.values(tools), dirname(createRequire(tools.npm).resolve("npm/package.json"))],
       allowWrite: [root],
       denyWrite: [
-        join(root, ".pi-work"),
+        join(root, ".pi-slice"),
         ...(present(join(root, ".pi")) ? [join(root, ".pi")] : []),
         "/tmp/claude",
         "/private/tmp/claude",
@@ -162,5 +164,5 @@ try{const path=${JSON.stringify(agentDir)};fs.readdirSync(path);const s=fs.statS
 catch(e){if(!['EPERM','EACCES','ENOENT'].includes(e.code))throw e;}
 const {Database}=require('bun:sqlite');const db=new Database(':memory:');assert.equal(db.query('select 1 as v').get().v,1);db.close();
 const node=Bun.spawnSync(['node','--no-warnings','-e',${JSON.stringify("const{DatabaseSync}=require('node:sqlite');const db=new DatabaseSync(':memory:');if(db.prepare('select 1 as v').get().v!==1)throw Error('SQLite');db.close();console.log(process.version)")}]);
-assert.equal(node.exitCode,0);assert.equal(node.stdout.toString().trim(),${JSON.stringify("v" + nodeVersion)});console.log('PI_WORK_OK');`;
+assert.equal(node.exitCode,0);assert.equal(node.stdout.toString().trim(),${JSON.stringify("v" + nodeVersion)});console.log('PI_SLICE_OK');`;
 }

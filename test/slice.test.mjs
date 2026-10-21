@@ -25,6 +25,7 @@ import { randomUUID } from "node:crypto";
 import { Header } from "tar";
 import { serviceAction, servicePaths } from "../features/service.ts";
 import { servicePlatform } from "../features/service-platform.ts";
+import { requirements } from "../sandbox.ts";
 
 const packageRoot = dirname(import.meta.dirname);
 const pi = realpathSync(
@@ -32,9 +33,9 @@ const pi = realpathSync(
     .map((dir) => join(dir, "pi"))
     .find(existsSync),
 );
-const base = realpathSync(mkdtempSync(join(process.platform === "darwin" ? "/tmp" : tmpdir(), "pi-work-")));
+const base = realpathSync(mkdtempSync(join(process.platform === "darwin" ? "/tmp" : tmpdir(), "pi-slice-")));
 let root, home, agent, project, plain, outside, visible, env;
-const mark = (path) => writeFileSync(join(path, ".pi-work"), JSON.stringify({ version: 1, id: randomUUID() }));
+const mark = (path) => writeFileSync(join(path, ".pi-slice"), JSON.stringify({ version: 1, id: randomUUID() }));
 const settings = {
   extensions: [join(packageRoot, "test/driver.ts")],
   quietStartup: true,
@@ -73,11 +74,11 @@ beforeEach(() => {
     ...process.env,
     HOME: home,
     PI_CODING_AGENT_DIR: agent,
-    PI_WORK_TEST_SECRET: "fixture",
+    PI_SLICE_TEST_SECRET: "fixture",
     GH_TOKEN: "fixture-github",
     AWS_SECRET_ACCESS_KEY: "fixture-aws",
     OPENAI_API_KEY: "fixture-provider",
-    JAVA_TOOL_OPTIONS: "-Dpi.work.host=secret",
+    JAVA_TOOL_OPTIONS: "-Dpi.slice.host=secret",
     GIT_CONFIG_COUNT: "1",
     GIT_CONFIG_KEY_0: "user.name",
     GIT_CONFIG_VALUE_0: "HOST_INJECTION",
@@ -85,6 +86,14 @@ beforeEach(() => {
   delete env.PI_CODING_AGENT_SESSION_DIR;
 });
 after(() => rmSync(base, { recursive: true, force: true }));
+
+test("Pi qualification accepts stable upgrades without an exact version pin", () => {
+  const host = { agentDir: agent, packageDir: packageRoot };
+  for (const version of ["1.4.0", "1.4.1", "1.5.0"])
+    assert.doesNotThrow(() => requirements(project, { ...host, version }));
+  for (const version of ["1.0.4", "1.3.0", "1.4.0-beta", "unknown"])
+    assert.throws(() => requirements(project, { ...host, version }), /Pi 1\.4\.0 or newer required/);
+});
 
 async function start(t, cwd = project, { args = [], environment = env } = {}) {
   const child = spawn(process.execPath, [pi, "--mode", "rpc", "--offline", ...args], { cwd, env: environment });
@@ -161,7 +170,7 @@ async function blocked(client, reason) {
   const shell = await client.bash("echo MUST_NOT_RUN");
   assert.equal(shell.exitCode, 1);
   assert.match(shell.output, reason);
-  for (const tool of ["read", "write", "edit", "bash", "work_service", "fixture-host"])
+  for (const tool of ["read", "write", "edit", "bash", "slice_service", "fixture-host"])
     await assert.rejects(client.tool(tool, {}), reason);
 }
 
@@ -181,25 +190,50 @@ test("unmarked directories keep ordinary Pi, auth, environment and tools", async
   assert.equal(readFileSync(join(agent, "auth.json"), "utf8"), original);
 });
 
+test("pi install discovers /slice without a /work alias and isolates after restart", { timeout: 20000 }, async (t) => {
+  const packageAgent = join(root, "package-agent");
+  mkdirSync(packageAgent);
+  writeFileSync(join(packageAgent, "settings.json"), JSON.stringify({ ...settings, extensions: [] }));
+  copyFileSync(join(agent, "auth.json"), join(packageAgent, "auth.json"));
+  const environment = { ...env, PI_CODING_AGENT_DIR: packageAgent };
+  const installed = spawnSync(process.execPath, [pi, "install", packageRoot], {
+    cwd: plain, env: environment, encoding: "utf8", timeout: 10000,
+  });
+  assert.equal(installed.status, 0, installed.stdout + installed.stderr);
+  const client = await start(t, plain, { environment });
+  const { commands } = await client.request({ type: "get_commands" });
+  assert.ok(commands.some(command => command.name === "slice" && command.sourceInfo.origin === "package"));
+  assert.ok(!commands.some(command => command.name === "work"));
+  await client.command("/slice init", "Workspace initialized.");
+  await client.request({ type: "get_state" });
+  assert.equal(await client.exited, 0);
+  assert.ok(existsSync(join(plain, ".pi-slice")));
+  const restarted = await start(t, plain, { environment });
+  assert.match(await restarted.command("/slice doctor", "pi-slice\n"), /sandbox    healthy/);
+  const denied = await restarted.bash(`cat '${outside}'`);
+  assert.notEqual(denied.exitCode, 0);
+  assert.doesNotMatch(denied.output, /host secret/);
+});
+
 test("init creates scratch and exits cleanly; restarting activates isolation", { timeout: 10000 }, async (t) => {
-  for (const path of [".pi-work", ".git", ".pi", ".pi-runtime", ".gitignore"])
+  for (const path of [".pi-slice", ".git", ".pi", ".pi-runtime", ".gitignore"])
     rmSync(join(project, path), { recursive: true, force: true });
   const client = await start(t);
   const auth = readFileSync(join(agent, "auth.json"), "utf8");
-  assert.match(await client.command("/work init", "Workspace initialized."), /Run pi again/);
-  // Pi 1.0.4 RPC checks deferred shutdown on its next input after async commands.
+  assert.match(await client.command("/slice init", "Workspace initialized."), /Run pi again/);
+  // RPC checks deferred shutdown on its next input after async commands.
   await client.request({ type: "get_state" });
   assert.equal(await client.exited, 0);
-  const config = JSON.parse(readFileSync(join(project, ".pi-work"), "utf8"));
+  const config = JSON.parse(readFileSync(join(project, ".pi-slice"), "utf8"));
   assert.equal(config.version, 1);
   assert.match(config.id, /^[0-9a-f-]{36}$/);
   assert.equal(readFileSync(join(project, ".gitignore"), "utf8"), ".pi-runtime/\n");
   assert.equal(existsSync(join(project, ".git")), false);
   assert.equal(readFileSync(join(agent, "auth.json"), "utf8"), auth);
   const restarted = await start(t);
-  assert.match(await restarted.command("/work", "pi-work\n"), /sandbox    healthy/);
+  assert.match(await restarted.command("/slice", "pi-slice\n"), /sandbox    healthy/);
   await assert.rejects(restarted.tool("read", { path: outside }));
-  assert.equal(existsSync(join(home, ".pi/work")), false);
+  assert.equal(existsSync(join(home, ".pi/slice")), false);
 });
 
 // Run the same assertions through model Bash and user ! commands.
@@ -210,7 +244,7 @@ async function probe({ outside, visible, agent, port, nodeVersion, npmVersion })
   assert.equal(process.env.HOME, process.cwd() + "/.pi-runtime/home");
   assert.equal(process.env.TMPDIR, process.cwd() + "/.pi-runtime/tmp");
   for (const name of [
-    "PI_WORK_TEST_SECRET",
+    "PI_SLICE_TEST_SECRET",
     "GH_TOKEN",
     "AWS_SECRET_ACCESS_KEY",
     "OPENAI_API_KEY",
@@ -218,7 +252,7 @@ async function probe({ outside, visible, agent, port, nodeVersion, npmVersion })
     "PI_SESSION_FILE",
   ])
     assert.equal(process.env[name], undefined, name);
-  assert.doesNotMatch(process.env.JAVA_TOOL_OPTIONS || "", /pi.work.host|secret/);
+  assert.doesNotMatch(process.env.JAVA_TOOL_OPTIONS || "", /pi.slice.host|secret/);
   assert.doesNotMatch(
     JSON.stringify(Object.fromEntries(Object.entries(process.env).filter(([key]) => key.startsWith("GIT_CONFIG_")))),
     /HOST_INJECTION/,
@@ -243,7 +277,7 @@ async function probe({ outside, visible, agent, port, nodeVersion, npmVersion })
       }
     } else denied(() => fs.writeFileSync(path, "escape"));
   }
-  for (const path of [".pi-work", ".pi/sentinel", ".git/config", ".git/hooks/sentinel", "/tmp/claude/pi-work-test"])
+  for (const path of [".pi-slice", ".pi/sentinel", ".git/config", ".git/hooks/sentinel", "/tmp/claude/pi-slice-test"])
     denied(() => fs.writeFileSync(path, "escape"));
   const link = ".pi-runtime/link-" + process.pid;
   fs.symlinkSync(outside, link);
@@ -320,14 +354,14 @@ test("model and user shells confine files, subprocesses, credentials and network
   const info = await client.fixture({ op: "info" });
   assert.equal(info.home, home);
   assert.equal(info.secret, true);
-  assert.deepEqual(info.tools.sort(), ["bash", "edit", "read", "work_service", "write"]);
+  assert.deepEqual(info.tools.sort(), ["bash", "edit", "read", "slice_service", "write"]);
   assert.ok(client.state.sessionFile.startsWith(join(agent, "sessions") + "/"));
   for (const [path, original] of originals) assert.equal(readFileSync(path, "utf8"), original);
 });
 
 test("file tools preserve text, edits and images without exposing host files", async (t) => {
   const client = await start(t),
-    content = "literal $(touch /tmp/pi-work-must-not-run) ' quotes\n" + "x".repeat(150000);
+    content = "literal $(touch /tmp/pi-slice-must-not-run) ' quotes\n" + "x".repeat(150000);
   await client.tool("write", { path: "large.txt", content });
   assert.equal(readFileSync(join(project, "large.txt"), "utf8"), content);
   await client.tool("edit", { path: "large.txt", edits: [{ oldText: "literal", newText: "edited" }] });
@@ -337,7 +371,7 @@ test("file tools preserve text, edits and images without exposing host files", a
   for (const path of [outside, join(agent, "auth.json"), "host-link"])
     await assert.rejects(client.tool("read", { path }));
   assert.match((await client.tool("read", { path: "visible-link" })).content[0].text, /read only/);
-  for (const path of [".pi-work", ".pi/sentinel", ".git/config", ".git/hooks/sentinel", visible, "visible-link"]) {
+  for (const path of [".pi-slice", ".pi/sentinel", ".git/config", ".git/hooks/sentinel", visible, "visible-link"]) {
     await assert.rejects(client.tool("write", { path, content: "escape" }), /EPERM|EACCES|EROFS|ENOENT/);
     await assert.rejects(client.tool("edit", { path, edits: [{ oldText: "protected", newText: "escape" }] }));
   }
@@ -350,7 +384,7 @@ test("file tools preserve text, edits and images without exposing host files", a
   await assert.rejects(client.tool("read", { path: "host-link" }));
   assert.equal(readFileSync(outside, "utf8"), "host secret");
   assert.equal(readFileSync(visible, "utf8"), "read only");
-  await assert.rejects(client.tool("fixture-host", {}), /Only read, bash, edit, write and work_service/);
+  await assert.rejects(client.tool("fixture-host", {}), /Only read, bash, edit, write and slice_service/);
   writeFileSync(
     join(project, "pixel.png"),
     Buffer.from(
@@ -394,7 +428,7 @@ test("continue and resume keep native sessions and auth", async (t) => {
     await resumed.close();
   }
   assert.equal(readFileSync(join(agent, "auth.json"), "utf8"), before);
-  assert.equal(existsSync(join(home, ".pi/work")), false);
+  assert.equal(existsSync(join(home, ".pi/slice")), false);
 });
 
 test("session switching follows ctx.cwd and restores unmarked directories", async (t) => {
@@ -442,7 +476,7 @@ test(
     const visible = [join(project, ".pi-runtime/visible.sock"), join(root, "host.sock")],
       hidden = [join(home, "hidden.sock")];
     for (const base of ["/run", "/var/run"]) {
-      const dir = mkdtempSync(join(base, process.getuid() === 0 ? "" : `user/${process.getuid()}`, "pi-work-"));
+      const dir = mkdtempSync(join(base, process.getuid() === 0 ? "" : `user/${process.getuid()}`, "pi-slice-"));
       t.after(() => rmSync(dir, { recursive: true, force: true }));
       hidden.push(join(dir, "host.sock"));
     }
@@ -525,11 +559,11 @@ test("dependency drift and an unconfined runtime block every tool", async (t) =>
 
 test("removing the marker cannot disable a running sandbox", async (t) => {
   const client = await start(t);
-  rmSync(join(project, ".pi-work"));
+  rmSync(join(project, ".pi-slice"));
   t.after(() => mark(project));
   assert.match((await client.bash("echo $HOME")).output, /\.pi-runtime\/home/);
   await assert.rejects(client.tool("read", { path: outside }));
-  await assert.rejects(client.tool("fixture-host", {}), /Only read, bash, edit, write and work_service/);
+  await assert.rejects(client.tool("fixture-host", {}), /Only read, bash, edit, write and slice_service/);
 });
 
 test("Node version rejection happens before workspace mutation", async (t) => {
@@ -546,10 +580,10 @@ test("Node version rejection happens before workspace mutation", async (t) => {
     mkdirSync(folder);
     const environment = { ...env, PATH: bin + ":" + env.PATH };
     let client = await start(t, folder, { environment });
-    await client.command("/work init", "pi-work: node >=24.0.0 required.");
+    await client.command("/slice init", "pi-slice: node >=24.0.0 required.");
     assert.equal(existsSync(join(folder, ".pi-runtime")), false);
-    assert.equal(existsSync(join(folder, ".pi-work")), false);
-    assert.equal(existsSync(join(agent, "pi-work")), false);
+    assert.equal(existsSync(join(folder, ".pi-slice")), false);
+    assert.equal(existsSync(join(agent, "pi-slice")), false);
     await client.close();
     mark(folder);
     client = await start(t, folder, { environment });
@@ -570,12 +604,12 @@ test("invalid markers block tools before creating runtime state", async (t) => {
   ].entries()) {
     const folder = join(home, "marker-" + index);
     mkdirSync(folder);
-    writeFileSync(join(folder, ".pi-work"), text);
+    writeFileSync(join(folder, ".pi-slice"), text);
     const client = await start(t, folder);
-    await blocked(client, /pi-work:/);
-    await client.command("/work init", "pi-work:");
+    await blocked(client, /pi-slice:/);
+    await client.command("/slice init", "pi-slice:");
     assert.equal(existsSync(join(folder, ".pi-runtime")), false);
-    assert.equal(readFileSync(join(folder, ".pi-work"), "utf8"), text);
+    assert.equal(readFileSync(join(folder, ".pi-slice"), "utf8"), text);
     await client.close();
   }
 });
@@ -583,9 +617,9 @@ test("invalid markers block tools before creating runtime state", async (t) => {
 test("doctor and repeated init preserve project and Pi settings", async (t) => {
   const before = readFileSync(join(agent, "settings.json"), "utf8"),
     client = await start(t);
-  assert.match(await client.command("/work doctor", "pi-work\n"), /sandbox    healthy/);
-  await client.command("/work init", "This workspace is already isolated.");
-  assert.match(await client.command("/work", "pi-work\n"), /sandbox    healthy/);
+  assert.match(await client.command("/slice doctor", "pi-slice\n"), /sandbox    healthy/);
+  await client.command("/slice init", "This workspace is already isolated.");
+  assert.match(await client.command("/slice", "pi-slice\n"), /sandbox    healthy/);
   assert.equal(readFileSync(join(project, ".gitignore"), "utf8"), ".pi-runtime/\n");
   assert.equal(readFileSync(join(agent, "settings.json"), "utf8"), before);
 });
@@ -622,7 +656,7 @@ test("snapshots carry only workspace assets and Git with fresh identity", async 
   mkdirSync(source);
   mark(source);
   const client = await start(t, source);
-  await client.command("/work init", "This workspace is already isolated.");
+  await client.command("/slice init", "This workspace is already isolated.");
   for (const path of ["src", ".git", "node_modules", ".pi-runtime/data"])
     mkdirSync(join(source, path), { recursive: true });
   for (const [path, content] of [
@@ -646,9 +680,9 @@ test("snapshots carry only workspace assets and Git with fresh identity", async 
   assert.equal(readFileSync(join(destination, ".git/config"), "utf8"), "[core]\n");
   for (const path of ["node_modules", ".pi-runtime", "external-link"])
     assert.equal(existsSync(join(destination, path)), false);
-  const config = JSON.parse(readFileSync(join(destination, ".pi-work"), "utf8"));
+  const config = JSON.parse(readFileSync(join(destination, ".pi-slice"), "utf8"));
   assert.deepEqual(Object.keys(config).sort(), ["id", "version"]);
-  assert.notEqual(config.id, JSON.parse(readFileSync(join(source, ".pi-work"), "utf8")).id);
+  assert.notEqual(config.id, JSON.parse(readFileSync(join(source, ".pi-slice"), "utf8")).id);
   assert.equal(existsSync(join(destination, ".pi-history")), false);
   assert.doesNotMatch(readFileSync(file, "utf8"), /PORTABLE_CONVERSATION|fixture-key|fixture-github/);
   await assert.rejects(client.fixture({ op: "unpack", file, destination }), /new destination/);
@@ -747,7 +781,7 @@ test("export rejects absolute links and restores metadata without truncating har
   await assert.rejects(client.fixture({ op: "pack" }), /Archive link leaves/);
   rmSync(join(project, "root-link")); rmSync(join(project, "indirect-link"));
   writeFileSync(join(project, ".gitignore"), "# original\n");
-  linkSync(join(project, ".pi-work"), join(project, "marker-copy"));
+  linkSync(join(project, ".pi-slice"), join(project, "marker-copy"));
   linkSync(join(project, ".gitignore"), join(project, "ignore-copy"));
   const marker = readFileSync(join(project, "marker-copy"), "utf8"),
     ignore = readFileSync(join(project, "ignore-copy"), "utf8");
@@ -762,10 +796,10 @@ test("export rejects absolute links and restores metadata without truncating har
 
 test("unmarked Pi reaches the real import prompt without creating a sandbox", async (t) => {
   const client = await start(t, plain);
-  await client.command("/work import ../missing.piw ../new", "pi-work: Restore needs interactive Pi");
+  await client.command("/slice import ../missing.slice ../new", "pi-slice: Restore needs interactive Pi");
   assert.equal(existsSync(join(plain, ".pi-runtime")), false);
   for (const command of ["web", "share", "snapshot", "restore", "doctor export", "doctor arbitrary", "init gold"])
-    await client.command("/work " + command, "pi-work: Use /work");
+    await client.command("/slice " + command, "pi-slice: Use /slice");
 });
 
 test(
@@ -778,7 +812,7 @@ test(
     mark(folder);
     writeFileSync(join(bin, process.platform === "linux" ? "flock" : "bun"),
       process.platform === "linux" ? "#!/bin/sh\nexit 1\n" :
-        '#!/bin/sh\nif [ "$1" = "--version" ]; then echo 1.4.2; else exit 1; fi\n',
+        '#!/bin/sh\nif [ "$1" = "--version" ]; then echo 1.4.3; else exit 1; fi\n',
       { mode: 0o700 });
     const client = await start(t, folder, { environment: { ...env, PATH: bin + ":" + env.PATH } });
     await blocked(client, /lock acquisition failed/);
@@ -809,10 +843,10 @@ test("owner death terminates an active Linux sandbox command", { skip: process.p
 test("status is read-only in both unmarked and marked Pi", async t => {
   for (const cwd of [plain, project]) {
     const client = await start(t, cwd), before = readdirSync(cwd);
-    const text = await client.command("/work", "pi-work\n");
+    const text = await client.command("/slice", "pi-slice\n");
     assert.match(text, cwd === plain ? /unmarked/ : /sandbox    healthy/);
     assert.deepEqual(readdirSync(cwd), before);
-    assert.equal(existsSync(join(agent, "pi-work", JSON.parse(readFileSync(join(project,".pi-work"),"utf8")).id)), false);
+    assert.equal(existsSync(join(agent, "pi-slice", JSON.parse(readFileSync(join(project,".pi-slice"),"utf8")).id)), false);
   }
 });
 
@@ -821,9 +855,9 @@ const nativeServices = process.platform === "linux"
   : process.platform === "darwin" && spawnSync("launchctl", ["print", "gui/" + process.getuid()], {stdio: "ignore"}).status === 0;
 const serviceSkip = nativeServices ? false : "Native service tests need a systemd user manager or launchd GUI session.";
 if (serviceSkip) console.warn("WARNING: " + serviceSkip + " Service integration coverage is skipped.");
-if (process.env.PI_WORK_REQUIRE_SERVICES === "1")
+if (process.env.PI_SLICE_REQUIRE_SERVICES === "1")
   assert.ok(nativeServices, "Native service tests are required here; refusing to skip them.");
-const service = async (client, params) => JSON.parse((await client.tool("work_service", params)).content[0].text);
+const service = async (client, params) => JSON.parse((await client.tool("slice_service", params)).content[0].text);
 function cleanupService(t) {
   const backend = servicePlatform(project), {label} = servicePaths(project, agent);
   t.after(async () => { if (await backend.active(label)) await backend.stop(label); });
@@ -836,14 +870,14 @@ test("a sandboxed preview survives Pi, permits edits and keeps its boundary afte
 import fs from 'node:fs'; import assert from 'node:assert/strict';
 function check(){
  for(const p of ${JSON.stringify([outside, join(agent, "auth.json")])}) assert.throws(()=>fs.readFileSync(p));
- for(const p of ['.pi-work','.git/config','.git/hooks/sentinel','asset-write']) assert.throws(()=>fs.writeFileSync(p,'bad'));
- for(const k of ['GH_TOKEN','OPENAI_API_KEY','AWS_SECRET_ACCESS_KEY','PI_WORK_TEST_SECRET']) assert.equal(process.env[k],undefined,k);
- assert.doesNotMatch(process.env.JAVA_TOOL_OPTIONS||'',/pi.work.host|secret/);
+ for(const p of ['.pi-slice','.git/config','.git/hooks/sentinel','asset-write']) assert.throws(()=>fs.writeFileSync(p,'bad'));
+ for(const k of ['GH_TOKEN','OPENAI_API_KEY','AWS_SECRET_ACCESS_KEY','PI_SLICE_TEST_SECRET']) assert.equal(process.env[k],undefined,k);
+ assert.doesNotMatch(process.env.JAVA_TOOL_OPTIONS||'',/pi.slice.host|secret/);
  assert.doesNotMatch(JSON.stringify(Object.fromEntries(Object.entries(process.env).filter(([k])=>k.startsWith('GIT_CONFIG_')))),/HOST_INJECTION/);
  fs.writeFileSync(process.env.XDG_DATA_HOME+'/state','private runtime');
  return 'PASS';
 }
-Bun.serve({unix:process.env.PI_WORK_SOCKET,fetch(req,server){
+Bun.serve({unix:process.env.PI_SLICE_SOCKET,fetch(req,server){
  const p=new URL(req.url).pathname;
  if(p==='/ws'&&server.upgrade(req))return;
  return new Response(p==='/check'?check():Bun.file('index.html'));
@@ -898,11 +932,11 @@ test("service startup rejects socket symlinks and never executes commands on the
   await new Promise(resolve => server.listen(secretSocket, resolve));
   t.after(() => new Promise(resolve => server.close(resolve)));
   const client = await start(t);
-  writeFileSync(join(project, "link.ts"), `require('node:fs').symlinkSync(${JSON.stringify(secretSocket)},process.env.PI_WORK_SOCKET);setInterval(()=>{},1000);`);
+  writeFileSync(join(project, "link.ts"), `require('node:fs').symlinkSync(${JSON.stringify(secretSocket)},process.env.PI_SLICE_SOCKET);setInterval(()=>{},1000);`);
   await assert.rejects(service(client, {action: "start", command: "bun run link.ts"}), /Unix socket|file or link/);
   assert.doesNotMatch(JSON.parse(readFileSync(servicePaths(project, agent).state, "utf8")).error, /^Error:/);
-  const failure = await client.command("/work run bun run link.ts", "pi-work:");
-  assert.match(failure, /^pi-work: PI_WORK_SOCKET/);
+  const failure = await client.command("/slice run bun run link.ts", "pi-slice:");
+  assert.match(failure, /^pi-slice: PI_SLICE_SOCKET/);
   assert.equal(connections, 0);
   await assert.rejects(service(client, {action: "start", command: `echo bad > '${visible}'`, preview: false}), /exited|stopped/);
   assert.equal(readFileSync(visible, "utf8"), "read only");
@@ -914,14 +948,14 @@ test("service cancellation stops startup and a foreground worker can be restarte
   cleanupService(t);
   const client = await start(t);
   const command = `bun -e 'setInterval(()=>console.log("WORKING"),100)'`;
-  assert.match(await client.fixture({op: "cancel", tool: "work_service", params: {action: "start", command}}), /Abort|cancel/i);
+  assert.match(await client.fixture({op: "cancel", tool: "slice_service", params: {action: "start", command}}), /Abort|cancel/i);
   assert.equal(await servicePlatform(project).active(servicePaths(project, agent).label), false);
   assert.equal((await service(client, {action: "start", command, preview: false})).state, "running");
   await assert.rejects(service(client, {action: "start", command}), /already running/);
-  await client.command("/work stop", "Service stopped.");
+  await client.command("/slice stop", "Service stopped.");
   assert.equal((await service(client, {action: "status"})).state, "stopped");
-  await client.command("/work run --background " + command, "Service running.");
-  assert.match(await client.command("/work logs", "Service running."), /\nWORKING\n/);
+  await client.command("/slice run --background " + command, "Service running.");
+  assert.match(await client.command("/slice logs", "Service running."), /\nWORKING\n/);
   await service(client, {action: "stop"});
 });
 
@@ -934,7 +968,7 @@ test("preview path length fails before launch; workers do not need a socket", {s
   await assert.rejects(service(client, {action: "start", command: "bun run server.ts"}), /Pi state path is too long/);
   assert.equal(existsSync(paths.dir), false);
   assert.equal(await backend.active(paths.label), false);
-  assert.match(await client.command("/work doctor", "pi-work\n"), /Pi state path is too long/);
+  assert.match(await client.command("/slice doctor", "pi-slice\n"), /Pi state path is too long/);
   await service(client, {action: "start", command: "sleep 60", preview: false});
   await service(client, {action: "stop"});
 });
@@ -959,14 +993,14 @@ test("logs stay bounded and saved services can be stopped after deleting their w
   const ordinary = await start(t, plain, {environment: {...env, PATH: bin + ":" + env.PATH}});
   const broken = servicePaths(join(root, "bad-config"), agent);
   mkdirSync(broken.dir); writeFileSync(broken.config, "broken JSON");
-  const listed = await ordinary.command("/work services", "Services\n");
+  const listed = await ordinary.command("/slice services", "Services\n");
   assert.ok(listed.includes(project)); assert.ok(listed.includes(paths.label)); assert.match(listed, /Service running/);
   assert.ok(listed.includes(broken.label)); assert.match(listed, /Invalid service configuration/);
-  assert.match(await ordinary.command("/work stop " + broken.label, "pi-work:"), /Invalid service configuration/);
-  await ordinary.command("/work stop " + paths.label, "Service stopped.");
+  assert.match(await ordinary.command("/slice stop " + broken.label, "pi-slice:"), /Invalid service configuration/);
+  await ordinary.command("/slice stop " + paths.label, "Service stopped.");
   assert.equal(await servicePlatform(project).active(paths.label), false);
   assert.equal(JSON.parse(readFileSync(paths.state, "utf8")).state, "stopped");
-  assert.match(await ordinary.command("/work stop not-ours", "pi-work:"), /Unknown service ID/);
+  assert.match(await ordinary.command("/slice stop not-ours", "pi-slice:"), /Unknown service ID/);
   assert.ok(existsSync(join(paths.dir, "runtime")), "Stopping keeps private app data");
 });
 
@@ -975,15 +1009,15 @@ test("failed sandbox startup still reports and stops a running service", {skip: 
   const client = await start(t);
   await service(client, {action: "start", command: "sleep 60", preview: false});
   await client.close();
-  const marker = readFileSync(join(project, ".pi-work"));
-  writeFileSync(join(project, ".pi-work"), "broken JSON");
+  const marker = readFileSync(join(project, ".pi-slice"));
+  writeFileSync(join(project, ".pi-slice"), "broken JSON");
   const invalid = await start(t);
-  const invalidStatus = await invalid.command("/work", "pi-work\n");
-  assert.match(invalidStatus, /sandbox    Invalid .pi-work JSON/);
+  const invalidStatus = await invalid.command("/slice", "pi-slice\n");
+  assert.match(invalidStatus, /sandbox    Invalid .pi-slice JSON/);
   assert.match(invalidStatus, /workspace  invalid marker/);
   assert.match(invalidStatus, /service    running/);
   await invalid.close();
-  writeFileSync(join(project, ".pi-work"), marker);
+  writeFileSync(join(project, ".pi-slice"), marker);
   const bin = join(root, "missing-flock"); mkdirSync(bin);
   // Keep only the native supervisor on PATH. Pi itself is launched by absolute path.
   const names = process.platform === "linux" ? ["systemctl", "systemd-run"] : ["launchctl", "bun"];
@@ -992,26 +1026,26 @@ test("failed sandbox startup still reports and stops a running service", {skip: 
     symlinkSync(realpathSync(path), join(bin, name));
   }
   const failed = await start(t, project, {environment: {...env, PATH: bin}});
-  const status = await failed.command("/work", "pi-work\n");
+  const status = await failed.command("/slice", "pi-slice\n");
   assert.match(status, /sandbox    Missing (bun|node)/);
   assert.match(status, /service    running/);
-  await failed.command("/work stop", "Service stopped.");
+  await failed.command("/slice stop", "Service stopped.");
   assert.equal(await servicePlatform(project).active(servicePaths(project, agent).label), false);
 });
 
 test("the service runner checks the installed Pi version", {skip: serviceSkip}, async t => {
   cleanupService(t);
   const packageDir = join(root, "changed-pi"); mkdirSync(packageDir);
-  writeFileSync(join(packageDir, "package.json"), JSON.stringify({version: "1.0.5"}));
-  const host = {version: "1.0.4", agentDir: agent, packageDir};
-  await assert.rejects(serviceAction(project, host, {action: "start", command: "sleep 60", preview: false}), /^Error: Pi 1\.0\.4 required\.$/);
-  assert.equal(JSON.parse(readFileSync(servicePaths(project, agent).state, "utf8")).error, "Pi 1.0.4 required.");
+  writeFileSync(join(packageDir, "package.json"), JSON.stringify({version: "1.3.0"}));
+  const host = {version: "1.4.0", agentDir: agent, packageDir};
+  await assert.rejects(serviceAction(project, host, {action: "start", command: "sleep 60", preview: false}), /^Error: Pi 1\.4\.0 or newer required\.$/);
+  assert.equal(JSON.parse(readFileSync(servicePaths(project, agent).state, "utf8")).error, "Pi 1.4.0 or newer required.");
 });
 
 test("service crashes are reported and supervisor stop kills descendants", {skip: serviceSkip}, async t => {
   cleanupService(t);
   const client = await start(t), paths = servicePaths(project, agent);
-  writeFileSync(join(project, "crash.ts"), `Bun.serve({unix:process.env.PI_WORK_SOCKET,fetch(req){if(new URL(req.url).pathname==='/crash')setTimeout(()=>process.exit(7),10);return new Response('OK');}});`);
+  writeFileSync(join(project, "crash.ts"), `Bun.serve({unix:process.env.PI_SLICE_SOCKET,fetch(req){if(new URL(req.url).pathname==='/crash')setTimeout(()=>process.exit(7),10);return new Response('OK');}});`);
   const state = await service(client, {action: "start", command: "bun run crash.ts"});
   await fetch(state.url + "/crash");
   const deadline = Date.now() + 5000;
@@ -1037,7 +1071,7 @@ test("missing service supervision explains the limitation while ordinary tools w
     writeFileSync(join(bin, name), "#!/bin/sh\nexit 1\n", {mode: 0o755});
   const client = await start(t, project, {environment: {...env, PATH: bin + ":" + env.PATH}});
   await assert.rejects(service(client, {action: "start", command: "bun run server.ts"}), /need a.*(systemd|launchd)/);
-  const doctor = await client.command("/work doctor", "pi-work\n");
+  const doctor = await client.command("/slice doctor", "pi-slice\n");
   assert.match(doctor, /no unsandboxed fallback/);
   assert.equal((await client.bash("echo STILL_WORKS")).output.trim(), "STILL_WORKS");
 });

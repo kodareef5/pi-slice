@@ -15,13 +15,13 @@ export const resolvePath = (root: string, path: string) =>
   resolve(root, path === "~" ? homedir() : path.startsWith("~/") ? join(homedir(), path.slice(2)) : path);
 
 export function readWorkspace(root: string): Workspace {
-  const path = join(root, ".pi-work");
-  if (!lstatSync(path).isFile()) throw Error(".pi-work must be a plain file.");
+  const path = join(root, ".pi-slice");
+  if (!lstatSync(path).isFile()) throw Error(".pi-slice must be a plain file.");
   let config;
   try {
     config = JSON.parse(readFileSync(path, "utf8"));
   } catch {
-    throw Error("Invalid .pi-work JSON.");
+    throw Error("Invalid .pi-slice JSON.");
   }
   if (
     !config ||
@@ -30,14 +30,14 @@ export function readWorkspace(root: string): Workspace {
     !uuid.test(config.id) ||
     Object.keys(config).some((key) => !["version", "id"].includes(key))
   ) {
-    throw Error("Unsupported .pi-work configuration.");
+    throw Error("Unsupported .pi-slice configuration.");
   }
   return config;
 }
 
 // Replace the directory entry; never truncate an archived hardlink or follow a symlink.
 function replaceFile(path: string, contents: string, mode = 0o600) {
-  const temp = join(dirname(path), ".pi-work-" + randomUUID());
+  const temp = join(dirname(path), ".pi-slice-" + randomUUID());
   try {
     writeFileSync(temp, contents, { flag: "wx", mode });
     renameSync(temp, path);
@@ -47,7 +47,7 @@ function replaceFile(path: string, contents: string, mode = 0o600) {
 }
 
 export function writeWorkspace(root: string, config: Workspace) {
-  replaceFile(join(root, ".pi-work"), JSON.stringify(config) + "\n");
+  replaceFile(join(root, ".pi-slice"), JSON.stringify(config) + "\n");
 }
 
 export function ignoreRuntime(root: string) {
@@ -64,11 +64,11 @@ export function ignoreRuntime(root: string) {
 }
 
 export function privateDir(agent: string, name: string) {
-  const base = join(agent, "pi-work"),
+  const base = join(agent, "pi-slice"),
     dir = join(base, name);
   for (const path of [base, dir]) {
     const stat = lstatSync(path, { throwIfNoEntry: false });
-    if (stat && !stat.isDirectory()) throw Error("Unsafe pi-work state directory.");
+    if (stat && !stat.isDirectory()) throw Error("Unsafe pi-slice state directory.");
     mkdirSync(path, { recursive: true, mode: 0o700 });
   }
   return dir;
