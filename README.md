@@ -13,10 +13,13 @@ servers remain trusted host code.
 
 ## Start
 
-Requires Pi ≥1.4 (Node distribution), Node ≥24, Bun ≥1.4.3, npm, Git and ripgrep.
+Requires Pi ≥1.4 (Node distribution), Node 24 LTS or newer, Bun ≥1.4.3, npm, Git and ripgrep.
 Linux also needs `bwrap`, `socat` and `flock`.
 
+Bun runs Slice's sandbox helpers and is installed separately:
+
 ```sh
+npm install -g bun
 pi install git:github.com/kodareef5/pi-slice
 cd /path/to/project
 pi

@@ -20,6 +20,8 @@ const systemPath = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
 export type PiHost = { version: string; agentDir: string; packageDir: string };
 
 export function requirements(cwd: string, pi: PiHost) {
+  if (Number(process.versions.node.split(".")[0]) < 24)
+    throw Error(`Run Pi with Node 24 LTS or newer (current: ${process.versions.node}).`);
   if (!["linux", "darwin"].includes(process.platform)) throw Error("Use macOS or Linux (Windows requires WSL).");
   const piVersion = /^(\d+)\.(\d+)\.(\d+)$/.exec(pi.version);
   if (!piVersion || Number(piVersion[1]) < 1 || (Number(piVersion[1]) === 1 && Number(piVersion[2]) < 4))
@@ -33,17 +35,8 @@ export function requirements(cwd: string, pi: PiHost) {
       throw Error("Choose a workspace outside trusted Pi state and installed extension code.");
   }
   const tools: Record<string, string> = {};
-  for (const name of [
-    "bun",
-    "node",
-    "npm",
-    "git",
-    "rg",
-    ...(process.platform === "linux" ? ["bwrap", "socat", "flock"] : []),
-  ]) {
-    tools[name] = executable(name, root);
-  }
   const version = (name: string, minimum: number[]) => {
+    tools[name] = executable(name, root);
     const result = spawnSync(tools[name], ["--version"], {
       cwd: "/",
       env: { PATH: systemPath, HOME: homedir() },
@@ -61,7 +54,8 @@ export function requirements(cwd: string, pi: PiHost) {
   };
   const nodeVersion = version("node", [24, 0, 0]),
     bunVersion = version("bun", [1, 4, 3]);
-  if (Number(process.versions.node.split(".")[0]) < 24) throw Error("Run Pi with Node >=24.0.0.");
+  for (const name of ["npm", "git", "rg", ...(process.platform === "linux" ? ["bwrap", "socat", "flock"] : [])])
+    tools[name] = executable(name, root);
   const runtimeVersion = JSON.parse(
     readFileSync(require.resolve("@anthropic-ai/sandbox-runtime/package.json"), "utf8"),
   ).version;

@@ -735,7 +735,7 @@ test("removing the marker cannot disable a running sandbox", async (t) => {
   await assert.rejects(client.tool("fixture-host", {}), /Only read, bash, edit, write/);
 });
 
-test("Node version rejection happens before workspace mutation", async (t) => {
+test("Node version rejection precedes missing Bun and workspace mutation", async (t) => {
   const bin = join(root, "fake-bin");
   mkdirSync(bin);
   for (const [index, script] of [
@@ -747,7 +747,7 @@ test("Node version rejection happens before workspace mutation", async (t) => {
     writeFileSync(join(bin, "node"), "#!/bin/sh\n" + script + "\n", { mode: 0o755 });
     const folder = join(home, "version-" + index);
     mkdirSync(folder);
-    const environment = { ...env, PATH: bin + ":" + env.PATH };
+    const environment = { ...env, PATH: bin };
     let client = await start(t, folder, { environment });
     await client.command("/slice init", "pi-slice: node >=24.0.0 required.");
     assert.equal(existsSync(join(folder, ".pi-runtime")), false);
@@ -760,6 +760,33 @@ test("Node version rejection happens before workspace mutation", async (t) => {
     await blocked(client, /node >=24.0.0 required/);
     await client.close();
   }
+});
+
+test("Pi's own Node runtime is checked before external dependencies", () => {
+  const descriptor = Object.getOwnPropertyDescriptor(process.versions, "node");
+  try {
+    Object.defineProperty(process.versions, "node", {value: "22.23.4"});
+    assert.throws(() => requirements(plain, {version: "1.4.0", agentDir: agent, packageDir: packageRoot}),
+      /Run Pi with Node 24 LTS or newer \(current: 22\.23\.4\)/);
+  } finally {
+    Object.defineProperty(process.versions, "node", descriptor);
+  }
+});
+
+test("missing Bun explains how to install the sandbox helper runtime", async t => {
+  const bin = join(root, "node-only");
+  mkdirSync(bin);
+  symlinkSync(process.execPath, join(bin, "node"));
+  const environment = {...env, PATH: bin};
+  const client = await start(t, plain, {environment});
+  const message = await client.command("/slice init", "pi-slice: Missing bun.");
+  assert.match(message, /sandbox helpers require Bun >=1\.4\.3/);
+  assert.match(message, /npm install -g bun, then restart Pi/);
+  assert.equal(existsSync(join(plain, ".pi-slice")), false);
+  assert.equal(existsSync(join(plain, ".pi-runtime")), false);
+  assert.equal(existsSync(join(agent, "pi-slice")), false);
+  await client.close();
+  await blocked(await start(t, project, {environment}), /Missing bun/);
 });
 
 test("invalid markers block tools before creating runtime state", async (t) => {

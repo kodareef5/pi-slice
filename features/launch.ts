@@ -39,8 +39,8 @@ export function enterProfile(packageRoot: string): SliceProfile | undefined {
       throw Error("Slice launch belongs to another workspace. Exit and run pi --slice in this directory.");
     return profile;
   }
-  if (typeof process.execve !== "function" || process.versions.bun || !process.argv[1])
-    throw Error("Automatic Slice restart requires the Node.js Pi distribution with Node >=24.");
+  if (Number(process.versions.node.split(".")[0]) < 24 || typeof process.execve !== "function" || process.versions.bun || !process.argv[1])
+    throw Error("Automatic Slice restart requires the Node.js Pi distribution with Node 24 LTS or newer.");
   saveProfile(root, agent, profile, true);
   // Extension factories may have run before this restart.
   const env = Object.fromEntries(Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined));

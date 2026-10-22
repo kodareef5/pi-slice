@@ -1,6 +1,6 @@
 {
   "name": "pi-slice",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "description": "Project isolation and minimal configuration for Pi",
   "type": "module",
   "keywords": [

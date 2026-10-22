@@ -101,7 +101,9 @@ export function executable(name: string, root?: string) {
         return false;
       }
     });
-  if (!path) throw Error(`Missing ${name}. Install it and add it to PATH.`);
+  if (!path) throw Error(`Missing ${name}. ${name === "bun"
+    ? "Slice's sandbox helpers require Bun >=1.4.3. Run npm install -g bun, then restart Pi."
+    : "Install it and add it to PATH."}`);
   const real = realpathSync(path);
   if (root && inside(real, root)) throw Error(`${name} must be installed outside the workspace.`);
   return real;
