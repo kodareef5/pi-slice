@@ -1,5 +1,3 @@
-// Real Pi TUI, including the internal exec restart. No model requests.
-// Run with: bun test/smoke-terminal.mjs
 import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -32,7 +30,7 @@ async function terminal(args, run) {
   const text = () => output.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "");
   try {
     await until(() => text().includes("gpt-6-astra"), () => "Pi TUI did not initialize: " + text());
-    // Pi renders the editor before its startup hooks have finished.
+    // The editor appears before startup hooks finish.
     await Bun.sleep(600);
     await run(tty, text, child);
     await until(() => child.exitCode !== null, () => "Pi did not exit: " + text());

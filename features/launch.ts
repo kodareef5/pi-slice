@@ -6,8 +6,7 @@ import { readProfile, saveProfile, type SliceProfile } from "./profile.ts";
 
 const launchKey = "PI_SLICE_LAUNCH";
 
-// Pi parses extension flags before knowing their types. Use the boolean = form
-// so `pi --slice "a prompt"` does not consume the prompt as a flag value.
+// The = form prevents Pi from consuming the prompt as --slice's value.
 export function normalizeSliceFlag(args: string[]) {
   return args.map((arg, index) => arg === "--slice" &&
     parseArgs([...args.slice(0, index), "--slice=probe"]).unknownFlags.get("slice") === "probe"
@@ -43,8 +42,7 @@ export function enterProfile(packageRoot: string): SliceProfile | undefined {
   if (typeof process.execve !== "function" || process.versions.bun || !process.argv[1])
     throw Error("Automatic Slice restart requires the Node.js Pi distribution with Node >=24.");
   saveProfile(root, agent, profile, true);
-  // Replace Pi before its TUI, MCP session hooks or model prompts start. Earlier
-  // extension factories may have run; this is a clean session, not a host-code boundary.
+  // Extension factories may have run before this restart.
   const env = Object.fromEntries(Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined));
   env[launchKey] = identity;
   const next = [process.execPath, ...process.execArgv, process.argv[1],

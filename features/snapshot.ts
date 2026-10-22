@@ -10,7 +10,6 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { exited } from "../process.ts";
 import { executable, ignoreRuntime, inside, quote, readWorkspace, resolvePath, staging, writeWorkspace } from "../workspace.ts";
 
-// Tar reads project files inside the OS sandbox, including during filesystem races.
 export function captureCommand(bun: string) {
   const list = `const fs=require('node:fs'),p=require('node:path'),root=process.cwd();
 function walk(dir){for(const e of fs.readdirSync(dir,{withFileTypes:true})){
@@ -21,7 +20,6 @@ process.stdout.write(path+'\\0');if(s.isDirectory())walk(path);}}walk('.');`;
   return `set -o pipefail; ${quote(bun)} --no-env-file --config=/dev/null -e ${quote(list)} | tar --null --no-recursion -T - -cf -`;
 }
 
-// Validate every entry before extraction, including links that escape through other links.
 export async function validate(file: string) {
   let invalid = "";
   const seen = new Set<string>(), links = new Map<string, { target: string; hard: boolean }>();
@@ -133,7 +131,6 @@ export async function snapshot(
   try {
     const contents = join(temp, "workspace.tar"), encrypted = join(temp, "snapshot.slice");
     await capture(captureCommand(bun), contents);
-    // Catch links changed during capture before reporting a successful export.
     await validate(contents);
     await crypt(ctx, age, ["-p"], contents, encrypted);
     copyFileSync(encrypted, target, constants.COPYFILE_EXCL);

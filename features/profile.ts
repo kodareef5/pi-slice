@@ -1,8 +1,8 @@
-import { lstatSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { lstatSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { createHash, randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import type { McpServerConfig } from "@earendil-works/pi-coding-agent";
-import { privateDir, readWorkspace } from "../workspace.ts";
+import { privateDir, readWorkspace, replaceFile } from "../workspace.ts";
 
 export type SliceProfile = {
   extensions: string[];
@@ -40,7 +40,6 @@ export function parseProfile(value: unknown): SliceProfile {
 }
 
 export function profilePath(root: string, agent: string) {
-  // A copied project marker must not opt another directory into trusted add-ons.
   const key = createHash("sha256").update(root + "\0" + readWorkspace(root).id).digest("hex");
   return join(agent, "pi-slice", "profiles", key + ".json");
 }
@@ -60,10 +59,6 @@ export function saveProfile(root: string, agent: string, profile: SliceProfile, 
     catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; readProfile(root, agent); }
     return path;
   }
-  const temp = path + "." + randomUUID();
-  try {
-    writeFileSync(temp, JSON.stringify(value, null, 2) + "\n", {flag: "wx", mode: 0o600});
-    renameSync(temp, path);
-  } finally { rmSync(temp, {force: true}); }
+  replaceFile(path, JSON.stringify(value, null, 2) + "\n");
   return path;
 }

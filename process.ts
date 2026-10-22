@@ -36,9 +36,7 @@ export function commandLock(agent: string, root: string, flock?: string, macBun?
     if (!path) return work();
     const fd = openSync(path, constants.O_CREAT | constants.O_RDWR | constants.O_NOFOLLOW, 0o600);
     try {
-      // The inherited fd shares our open file description: the lock survives
-      // flock's exit and lasts until close(fd), including on process death.
-      // macOS has flock(2), but no flock CLI. Bun calls the same fd-based lock.
+      // The inherited fd holds the lock until close(fd) or process death.
       const child = flock
         ? spawn(flock, ["--exclusive", "3"], { stdio: ["ignore", "ignore", "pipe", fd] })
         : spawn(macBun!, ["--no-env-file", "--config=/dev/null", "-e",

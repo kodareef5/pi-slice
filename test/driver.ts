@@ -1,4 +1,3 @@
-// Exercise Pi's registered tools without making model requests.
 import slice from "../extension.ts";
 import { getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { writeFileSync } from "node:fs";
@@ -38,7 +37,6 @@ export default function driver(pi: ExtensionAPI) {
             trusted: ctx.isProjectTrusted(),
           };
         else if (request.op === "persist") {
-          // Pi only saves sessions containing user or assistant messages.
           (ctx.sessionManager as any).appendMessage({
             role: "user",
             content: [{ type: "text", text: request.text || "fixture session" }],

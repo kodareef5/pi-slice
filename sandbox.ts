@@ -111,7 +111,7 @@ export function prepareRuntime(runtime: string, tools: Record<string, string>): 
     GIT_CONFIG_GLOBAL: "/dev/null",
     GIT_CONFIG_NOSYSTEM: "1",
     GIT_TERMINAL_PROMPT: "0",
-    // Git's default templates copy sample hooks into a write-protected path.
+    // Sample hooks cannot be copied into protected .git/hooks paths.
     GIT_TEMPLATE_DIR: "",
     NODE_USE_ENV_PROXY: "1",
     LANG: process.platform === "linux" ? "C.UTF-8" : "en_US.UTF-8",
@@ -137,7 +137,6 @@ export function policy(root: string, tools: Record<string, string>, agentDir: st
       ],
       allowRead: [root, ...Object.values(tools), dirname(createRequire(tools.npm).resolve("npm/package.json"))],
       allowWrite: [root],
-      // Clone/init need repository-local config. Conventional .git/hooks stay protected.
       allowGitConfig: true,
       denyWrite: [
         join(root, ".pi-slice"),

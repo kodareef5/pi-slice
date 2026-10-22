@@ -17,7 +17,6 @@ export function launchAgent(label: string, args: string[], log: string) {
 </dict></plist>`;
 }
 
-// Native supervisors own processes. No saved PID is ever used to stop a service.
 export function servicePlatform(root: string, platform = process.platform) {
   const hostEnv = { HOME: homedir(), PATH: process.env.PATH,
     XDG_RUNTIME_DIR: process.env.XDG_RUNTIME_DIR, DBUS_SESSION_BUS_ADDRESS: process.env.DBUS_SESSION_BUS_ADDRESS };
@@ -27,7 +26,7 @@ export function servicePlatform(root: string, platform = process.platform) {
     name: "systemd user service",
     async check() {
       try { await run("systemctl", ["--user", "show-environment"]); executable("systemd-run", root); }
-      catch { throw Error("Background services need a running systemd user manager on Linux. This host has none available. Pi Slice tools still work; no unsandboxed fallback is used. Use a systemd user session or a future alternative backend."); }
+      catch { throw Error("Background services need a running systemd user manager."); }
     },
     async active(label: string) {
       try { return /^(active|activating|deactivating)$/.test((await run("systemctl", ["--user", "show", label, "--property=ActiveState", "--value"])).trim()); }
@@ -45,20 +44,18 @@ export function servicePlatform(root: string, platform = process.platform) {
       name: "launchd agent",
       async check() {
         try { await run("launchctl", ["print", domain]); }
-        catch { throw Error("Background services need a logged-in macOS launchd user session. Pi Slice tools still work; no unsandboxed fallback is used."); }
+        catch { throw Error("Background services need a logged-in macOS launchd user session."); }
       },
       async active(label: string) {
         try {
           const status = await run("launchctl", ["print", domain + "/" + label]);
-          // launchd assigns a PID while xpcproxy is still preparing the process.
-          // Treat that startup phase as active so callers do not stop it early.
+          // xpcproxy has a PID before launchd reports "running".
           return /^\s*state = (running|spawn scheduled)\s*$/m.test(status) ||
             /^\s*pid = [1-9]\d*\s*$/m.test(status);
         }
         catch { return false; }
       },
       async start(label: string, args: string[], dir: string) {
-        // A completed job can remain registered. Its program is no longer running.
         try { await run("launchctl", ["bootout", domain + "/" + label]); } catch {}
         const file = join(dir, "agent.plist");
         writeFileSync(file, launchAgent(label, args, join(dir, "supervisor.log")), {mode: 0o600});
@@ -75,5 +72,5 @@ export function servicePlatform(root: string, platform = process.platform) {
       },
     };
   }
-  throw Error("Background services support systemd on Linux and launchd on macOS. No backend is available on this platform.");
+  throw Error(`No backend for background services on ${platform}.`);
 }

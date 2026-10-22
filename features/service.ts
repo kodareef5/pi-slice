@@ -1,9 +1,9 @@
-import { createHash, randomUUID } from "node:crypto";
-import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import { homedir } from "node:os";
 import { commandLock } from "../process.ts";
-import { executable, privateDir, readWorkspace } from "../workspace.ts";
+import { executable, privateDir, readWorkspace, replaceFile } from "../workspace.ts";
 import { requirements, type PiHost } from "../sandbox.ts";
 import { servicePlatform } from "./service-platform.ts";
 
@@ -17,17 +17,12 @@ export function serviceText(state: ServiceState & {output?: string}) {
 
 export function socketPrefix(agent: string) {
   const prefix = join(realpathSync(agent), "pi-slice/sockets/s-");
-  // mkdtemp adds six characters; leave room for the socket name on both OSes.
   if (Buffer.byteLength(prefix + "XXXXXX/in/app") > 100)
     throw Error("Pi state path is too long for a preview socket. Use a shorter PI_CODING_AGENT_DIR.");
   return prefix;
 }
 export function record(path: string, value: unknown) {
-  const temp = path + "." + randomUUID();
-  try {
-    writeFileSync(temp, JSON.stringify(value) + "\n", {mode: 0o600, flag: "wx"});
-    renameSync(temp, path);
-  } finally { rmSync(temp, {force: true}); }
+  replaceFile(path, JSON.stringify(value) + "\n");
 }
 
 export function servicePaths(root: string, agent: string) {
@@ -50,7 +45,6 @@ export async function serviceStatus(root: string, pi: PiHost): Promise<ServiceSt
   return state;
 }
 
-// User-only inventory. The model tool remains limited to its current workspace.
 export async function savedServices(pi: PiHost) {
   const dir = join(pi.agentDir, "pi-slice/services");
   if (!existsSync(dir)) return [];
@@ -71,7 +65,6 @@ export async function savedServices(pi: PiHost) {
 
 export async function serviceAction(root: string, pi: PiHost, request: ServiceRequest, signal?: AbortSignal) {
   if (!["start", "status", "logs", "stop"].includes(request.action)) throw Error("Unknown service action.");
-  // Diagnostics and stop still work if tools were removed or the project is gone.
   if (request.action === "status") return serviceStatus(root, pi);
   if (request.action === "logs") {
     const paths = servicePaths(root, pi.agentDir);
@@ -131,7 +124,6 @@ export async function serviceAction(root: string, pi: PiHost, request: ServiceRe
       }
       throw Error("Service startup timed out. Preview servers must listen on the Unix socket in PI_SLICE_SOCKET; use preview:false for a worker.");
     } catch (error) {
-      // A timed-out supervisor call may already have started the job.
       await backend.stop(paths.label).catch(() => {});
       record(paths.state, {state: "failed", command, error: error instanceof Error ? error.message : String(error)});
       throw error;

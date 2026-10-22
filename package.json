@@ -1,7 +1,7 @@
 {
   "name": "pi-slice",
-  "version": "0.3.1",
-  "description": "Opt-in project isolation for Pi",
+  "version": "0.3.2",
+  "description": "Project isolation and minimal configuration for Pi",
   "type": "module",
   "keywords": [
     "pi-package",

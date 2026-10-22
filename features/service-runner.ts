@@ -32,9 +32,7 @@ const note = (text: string | Buffer) => {
 const stopChild = async () => {
   if (process.platform === "linux") return terminate(child);
   if (!child) return;
-  // launchd owns this process group. Wait for the direct child's exit, then
-  // close inherited pipes so descendants cannot prevent the runner exiting
-  // and launchd completing process-group cleanup.
+  // Close inherited pipes so descendants cannot stall launchd's group cleanup.
   try {
     if (child.pid && child.exitCode === null && !child.signalCode) {
       const done = exited(child, "exit");
@@ -142,8 +140,7 @@ try {
     settings.network.allowUnixSockets = [inbox];
     env.PI_SLICE_SOCKET = appSocket;
   }
-  // Mandatory deny placeholders belong only to this private runtime. Pi's
-  // command cleanup cannot remove them; the project itself is read-only here.
+  // Keep service deny placeholders separate from Pi's command cleanup.
   process.chdir(runtime);
   await manager.initialize(settings);
   initialized = true;
@@ -153,7 +150,6 @@ try {
     throw Error("Background sandbox startup probe failed. " + logTail());
   logSize = 0;
   writeFileSync(paths.log, "", {mode: 0o600});
-  // Do not await the foreground app's completion during startup.
   let ended = false;
   const launched = await launch(config.command, env);
   const done = launched.done.then(code => { ended = true; return code; });
@@ -167,8 +163,7 @@ try {
   if (ended || ending) throw Error("Service exited before startup completed. " + logTail());
   let url: string | undefined;
   if (config.preview) {
-    // Move the socket into a directory the app cannot write, then validate it.
-    // Never make host connections through an app-controlled path or symlink.
+    // Take the socket out of the app's control before validating and connecting.
     renameSync(appSocket, backend);
     if (!lstatSync(backend).isSocket()) throw Error("PI_SLICE_SOCKET must be a Unix socket, not a file or link.");
     forward(backend);

@@ -35,8 +35,8 @@ export function readWorkspace(root: string): Workspace {
   return config;
 }
 
-// Replace the directory entry; never truncate an archived hardlink or follow a symlink.
-function replaceFile(path: string, contents: string, mode = 0o600) {
+// Rename avoids following symlinks or truncating archived hardlinks.
+export function replaceFile(path: string, contents: string, mode = 0o600) {
   const temp = join(dirname(path), ".pi-slice-" + randomUUID());
   try {
     writeFileSync(temp, contents, { flag: "wx", mode });

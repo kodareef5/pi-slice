@@ -71,27 +71,14 @@ export default function slice(pi: ExtensionAPI) {
   });
   pi.on("before_agent_start", (event, ctx) => {
     if (!ready || realpathSync(ctx.cwd) !== root) return;
-    event.systemPromptOptions.sections.pi_slice = `You are in a Pi Slice workspace: ${root}.
-Pi keeps normal auth and sessions. Your read, bash, edit and write tools run inside an OS sandbox.
-Configuration: ${configuration}. Additional tools explicitly enabled by the user, including MCP servers, have their own permissions outside this sandbox.
-Bash, Bun (including TypeScript and bun:sqlite), Node/npm (including node:sqlite), Git and rg are available. Check other tools such as Python before relying on them.
-Default to Bun and TypeScript for new scripts and web projects: Bun.serve, Bun.file, bun run and bun add when dependencies are needed. Follow an existing project's stack or the user's preference.
-Match the requested scope. A basic HTML dashboard usually needs only index.html and a tiny server.ts, without framework scaffolding, custom APIs or a test harness. Inspect relevant project files; skip routine host/tool inventories. Do not assume Git is initialized.
-Git clone and git init <subdirectory> work normally inside the workspace. Repository-local config is writable; default hook templates are skipped.${process.platform === "darwin" ? " To initialize Git at the workspace root itself, the user must run git init in the host terminal; macOS pins that .git directory to protect hooks. Git add/commit work for existing repositories." : ""}
-Project secrets remain readable; writes are limited to the workspace. Homes and Pi state are hidden; other host paths are generally read-only. Internet and local/LAN services are reachable through proxies. Linux permits Unix sockets on visible paths.
-HOME, caches and scratch files live under .pi-runtime. ${process.platform === "linux" ? "Background processes end with each shell command; run a server and its checks in the same command. Sandbox localhost is separate from the host browser." : "Local network binding is restricted."} Use git add <paths>; sandbox placeholders can break git add -A.
-Use slice_service to start, inspect, read logs or stop one background service for this workspace when the user asks. It survives Pi/terminal exit, using systemd on Linux or launchd on macOS; unsupported hosts get an explanation. No automatic restart after reboot.
-For a browser preview, configure Bun.serve({ unix: process.env.PI_SLICE_SOCKET, fetch }) and call slice_service with action:"start", command:"bun run server.ts". Return its localhost URL. Use preview:false for a worker. Keep the command in the foreground; do not use &, nohup or PM2. Starting the service is enough; the user need not keep a terminal open.
-Background services read project files but write only to their private HOME/cache/TMPDIR/XDG_DATA_HOME. Install dependencies and build assets with normal tools first. Service runtime data stays on this machine and is not exported. Existing service code changes may need stop/start. Do not bypass an unavailable supervisor by running project code unsandboxed.
-These are user commands entered in Pi, not shell commands:
-/slice — status; /slice doctor — requirements and diagnostics; /slice init [new] — initialize (new resets identity; first setup exits Pi for restart).
-/slice export [file.slice] — encrypted assets and Git, excluding runtime/dependencies; no Pi account or conversation collection.
-/slice import <file.slice> <new-directory> — restore assets with a fresh workspace ID. Both transfer commands require the user's interactive password prompt.
-/slice run <command> — start a Unix-socket preview; /slice run --background <command> — start a worker; /slice logs and /slice stop — service controls.
-/slice services — user-only inventory; /slice stop <service-id> also works from unmarked Pi to stop a deleted workspace's service.
-/slice config — user-only editor for this workspace's extensions, skills, prompts, extra tools and MCP servers. Configuration changes require restarting pi --slice.
-You can build and test TypeScript/Bun dashboards. Cloudflare publishing or sharing needs a separate authenticated setup; Pi Slice provides no deployment or sharing command. Guide the user through host-side authentication without copying credentials into the workspace.
-Pi documentation and skill paths listed elsewhere may be hidden. Use this section for Pi Slice help instead of searching host directories.`;
+    event.systemPromptOptions.sections.pi_slice = `Slice workspace: ${root}. Configuration: ${configuration}.
+read, bash, edit and write run in an OS sandbox. Writes stay in the workspace; HOME, caches and scratch files live in .pi-runtime. Homes and Pi state are hidden; other host paths and project secrets remain readable.
+Network access, including local services, uses proxies. Added extensions and MCP servers have their own host permissions.
+Bash, Bun, Node/npm, Git and rg are available. Follow the project's stack.
+Git clone and git init <subdirectory> work normally. Use git add <paths>; sandbox placeholders can break git add -A.${process.platform === "darwin" ? " Initializing Git at the workspace root needs git init in the host terminal." : ""}
+Use slice_service for persistent previews and workers.${process.platform === "linux" ? " Other background processes end with each shell command." : ""}
+User commands: /slice (status), /slice doctor, /slice config, /slice run, /slice logs, /slice stop, /slice services, /slice export and /slice import. Config changes need a restart; snapshots need an interactive password prompt.
+Selected skill directories are readable; other Pi documentation may be hidden.`;
   });
   pi.on("tool_call", (event, ctx) => {
     if (protectedContext(ctx) && (!ready || !allowed(event.toolName) || realpathSync(ctx.cwd) !== root))
@@ -130,8 +117,6 @@ Pi documentation and skill paths listed elsewhere may be hidden. Use this sectio
         const rules = policy(root, found.tools, getAgentDir());
         if (profile) for (const skill of loadSkills({cwd: root, agentDir: getAgentDir(),
           skillPaths: parseArgs(process.argv.slice(2)).skills ?? [], includeDefaults: false}).skills) {
-          // Selected skills need their instructions and bundled assets. Loose
-          // Markdown files grant access only to that file, not its parent.
           rules.filesystem.allowRead.push(realpathSync(basename(skill.filePath) === "SKILL.md" ? skill.baseDir : skill.filePath));
         }
         await manager.initialize(rules);
@@ -148,8 +133,7 @@ Pi documentation and skill paths listed elsewhere may be hidden. Use this sectio
         }, combined);
       };
       const local = createLocalBashOperations({ shellPath: "/bin/bash" });
-      // Reapply HOME/TMPDIR inside the sandbox: its runtime may set its own temporary directory.
-      // Sandbox-runtime resolves its mandatory denies against process.cwd().
+      // Sandbox-runtime resolves mandatory denies against process.cwd().
       let wrapping: Promise<unknown> = Promise.resolve();
       const wrap = (command: string, signal?: AbortSignal) => {
         const result = wrapping.then(async () => {
@@ -221,7 +205,6 @@ Pi documentation and skill paths listed elsewhere may be hidden. Use this sectio
       if (probe.exitCode !== 0 || output.trim() !== "PI_SLICE_OK")
         throw Error("Sandbox startup probe failed. " + output.slice(-1200));
 
-      // File I/O runs inside the sandbox. JSON stdin keeps file contents out of shell arguments.
       const ioScript = `try {
 const[op,path,data]=JSON.parse(await Bun.stdin.text()),fs=require('node:fs');
 let result;
@@ -262,8 +245,7 @@ if(Buffer.isBuffer(result))process.stdout.write(result);
       pi.registerTool({
         name: "slice_service",
         label: "Workspace service",
-        description: "Manage this workspace's sandboxed background service. Start only when the user asks to run/host an app or worker. Preview apps must listen on the Unix socket in PI_SLICE_SOCKET; Bun.serve({unix: process.env.PI_SLICE_SOCKET, fetch}) works. Project code is read-only; HOME, TMPDIR and XDG_DATA_HOME are writable private runtime. Use preview:false for workers. No host commands or credentials are exposed.",
-        promptSnippet: "Start, inspect, read logs or stop a sandboxed service that survives Pi exiting.",
+        description: "Manage one sandboxed service that survives Pi exiting. Start when requested. Previews listen on PI_SLICE_SOCKET, e.g. Bun.serve({unix: process.env.PI_SLICE_SOCKET, fetch}); workers use preview:false. Project files are read-only; HOME, TMPDIR and XDG_DATA_HOME are writable. Install dependencies and build before starting.",
         parameters: Type.Object({
           action: Type.Union([Type.Literal("start"), Type.Literal("status"), Type.Literal("logs"), Type.Literal("stop")]),
           command: Type.Optional(Type.String({description: "Foreground shell command; required to start."})),
@@ -311,7 +293,7 @@ if(Buffer.isBuffer(result))process.stdout.write(result);
             ctx.ui.notify(`Slice configuration: ${path}\nEdit this file from your host terminal, then restart pi --slice.`, "info");
             return;
           }
-          const text = await ctx.ui.editor("Slice configuration — added tools and MCP servers have their own permissions", JSON.stringify(current, null, 2));
+          const text = await ctx.ui.editor("Slice configuration", JSON.stringify(current, null, 2));
           if (text === undefined) return;
           saveProfile(found.root, getAgentDir(), parseProfile(JSON.parse(text)));
           ctx.ui.notify("Slice configuration saved. Restart pi --slice to apply it.", "info");
@@ -337,7 +319,6 @@ if(Buffer.isBuffer(result))process.stdout.write(result);
         if (command === "" || command === "doctor") {
           const isMarked = marked(ctx.cwd);
           let identity = isMarked ? "invalid marker" : "unmarked";
-          // A broken marker must not hide a still-running service.
           if (isMarked) { try { identity = readWorkspace(ctx.cwd).id; } catch {} }
           const status = ready ? "healthy" : protectedContext(ctx) ? failure : "off; run /slice init";
           const available = (name: string) => {
@@ -350,11 +331,8 @@ if(Buffer.isBuffer(result))process.stdout.write(result);
           }
           if (command === "doctor") {
             const found = requirements(ctx.cwd);
-            text += `\nPi ${VERSION}; Node ${found.nodeVersion}; Bun ${found.bunVersion}: OK.\n` +
-              "Git: clone and init in subdirectories work normally; default hook templates are skipped. Local config is writable. Use git add <paths>; runtime placeholders can prevent git add -A. Configure name/email on the host.\n" +
-              "Files are private (0600/0700). Linux background processes end with each command; macOS restricts local binding." +
-              (process.platform === "darwin" ? "\nWorkspace-root Git initialization still needs git init in the host terminal; macOS pins the .git parent of protected hooks." : "");
-            try { const backend = servicePlatform(found.root); await backend.check(); text += `\nBackground service: ${backend.name} available. Project read-only; private runtime writable. Survives Pi/terminal exit; logout behavior follows the user service manager. Not started automatically after reboot.`; }
+            text += `\nPi ${VERSION}; Node ${found.nodeVersion}; Bun ${found.bunVersion}: OK.`;
+            try { const backend = servicePlatform(found.root); await backend.check(); text += `\nServices: ${backend.name}.`; }
             catch (error) { text += "\n" + String(error); }
             try { socketPrefix(getAgentDir()); }
             catch (error) { text += "\n" + (error instanceof Error ? error.message : String(error)); }
@@ -391,7 +369,7 @@ if(Buffer.isBuffer(result))process.stdout.write(result);
           if (ready) { ctx.ui.notify("This workspace is already isolated.", "info"); return; }
           if (!existing) {
             root = found.root;
-            failure = "Workspace initialized. Pi is closing. Run pi again with --slice for sandboxed tools and a minimal configuration.";
+            failure = "Workspace initialized. Restart with pi --slice.";
             ctx.ui.notify(failure, "info");
             ctx.shutdown();
             return;

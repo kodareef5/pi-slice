@@ -125,7 +125,6 @@ async function start(t, cwd = project, { args = [], environment = env } = {}) {
   const exited = new Promise((resolve) => child.once("exit", resolve));
   const receive = async (type, match) => {
     try {
-      // Service startup permits 45 seconds plus bounded supervisor shutdown.
       for await (const [event] of on(events, type, { signal: AbortSignal.timeout(60000) }))
         if (match(event)) return event;
     } catch (error) {
@@ -385,7 +384,7 @@ test("init creates scratch and exits cleanly; restarting activates isolation", {
     rmSync(join(project, path), { recursive: true, force: true });
   const client = await start(t);
   const auth = readFileSync(join(agent, "auth.json"), "utf8");
-  assert.match(await client.command("/slice init", "Workspace initialized."), /Run pi again/);
+  assert.match(await client.command("/slice init", "Workspace initialized."), /pi --slice/);
   // RPC checks deferred shutdown on its next input after async commands.
   await client.request({ type: "get_state" });
   assert.equal(await client.exited, 0);
@@ -401,7 +400,6 @@ test("init creates scratch and exits cleanly; restarting activates isolation", {
   assert.equal(existsSync(join(home, ".pi/slice")), false);
 });
 
-// Run the same assertions through model Bash and user ! commands.
 async function probe({ outside, visible, agent, port, nodeVersion, npmVersion }) {
   const fs = require("node:fs"),
     assert = require("node:assert/strict");
@@ -544,7 +542,7 @@ test("file tools preserve text, edits and images without exposing host files", a
     await assert.rejects(client.tool("write", { path, content: "escape" }), /EPERM|EACCES|EROFS|ENOENT/);
     await assert.rejects(client.tool("edit", { path, edits: [{ oldText: "protected", newText: "escape" }] }));
   }
-  // Linux can write disposable copies of hidden paths; the original must stay untouched.
+  // Linux masks hidden paths with disposable copies.
   try {
     await client.tool("write", { path: "host-link", content: "escape" });
   } catch (error) {
@@ -911,7 +909,6 @@ test("ordinary Git clones and nested init use standard metadata in both session 
   git(["add", "hello.txt"]);
   git(["-c", "user.name=Fixture", "-c", "user.email=fixture@example.com", "commit", "-m", "fixture"]);
   git(["update-server-info"]);
-  // Dumb HTTP exercises Git through the sandbox proxy without external services.
   const server = createServer((request, response) => {
     const path = new URL(request.url, "http://fixture").pathname;
     try { response.end(readFileSync(join(source, ".git", path))); }
@@ -930,7 +927,6 @@ test("ordinary Git clones and nested init use standard metadata in both session 
     }],
     ["minimal", command => minimal.bash(command)],
   ]) {
-    // The local fixture also needs the proxy: direct loopback is sandboxed.
     const result = await run(`export NO_PROXY= no_proxy=; git clone '${url}' ${name}-clone && git init ${name}-new && ` +
       `git -C ${name}-clone config slice.fixture yes && git -C ${name}-clone status --porcelain`);
     assert.equal(result.exitCode, 0, result.output);
@@ -948,8 +944,7 @@ test("fresh Git initialization and commits use only host name/email", async (t) 
   rmSync(join(project, ".git"), { recursive: true });
   const client = await start(t);
   if (process.platform === "darwin") {
-    // Seatbelt pins the workspace-root .git parent of protected hooks even
-    // before it exists. Nested init/clone work; root init still needs the host.
+    // Seatbelt pins .git at the workspace root, even before it exists.
     const denied = await client.bash("git init");
     assert.notEqual(denied.exitCode, 0);
     assert.match(denied.output, /Operation not permitted|Permission denied/);
@@ -1041,7 +1036,6 @@ test(
 
 test("owner death terminates an active Linux sandbox command", { skip: process.platform !== "linux" }, async (t) => {
   const client = await start(t);
-  // Send without waiting for a reply from the owner we are deliberately killing.
   client.child.stdin.write(
     JSON.stringify({
       id: "orphan",
@@ -1205,7 +1199,6 @@ test("logs stay bounded and saved services can be stopped after deleting their w
   assert.match((await service(client, {action: "logs"})).output, /LATEST\nplain logs/);
   await client.close();
   rmSync(project, {recursive: true});
-  // Diagnostics and stop need no version probes. macOS still uses Bun for flock.
   const bin = join(root, "broken-tools"); mkdirSync(bin);
   for (const name of process.platform === "linux" ? ["bun", "node"] : ["node"])
     writeFileSync(join(bin, name), "#!/bin/sh\nexit 99\n", {mode: 0o755});
@@ -1238,7 +1231,6 @@ test("failed sandbox startup still reports and stops a running service", {skip: 
   await invalid.close();
   writeFileSync(join(project, ".pi-slice"), marker);
   const bin = join(root, "missing-flock"); mkdirSync(bin);
-  // Keep only the native supervisor on PATH. Pi itself is launched by absolute path.
   const names = process.platform === "linux" ? ["systemctl", "systemd-run"] : ["launchctl", "bun"];
   for (const name of names) {
     const path = env.PATH.split(":").map(dir => join(dir, name)).find(existsSync);
@@ -1291,6 +1283,6 @@ test("missing service supervision explains the limitation while ordinary tools w
   const client = await start(t, project, {environment: {...env, PATH: bin + ":" + env.PATH}});
   await assert.rejects(service(client, {action: "start", command: "bun run server.ts"}), /need a.*(systemd|launchd)/);
   const doctor = await client.command("/slice doctor", "pi-slice\n");
-  assert.match(doctor, /no unsandboxed fallback/);
+  assert.match(doctor, /Background services need/);
   assert.equal((await client.bash("echo STILL_WORKS")).output.trim(), "STILL_WORKS");
 });
