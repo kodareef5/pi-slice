@@ -6,6 +6,7 @@ import { pipeline } from "node:stream/promises";
 import {
   VERSION, getAgentDir, getPackageDir, createLocalBashOperations, createBashToolDefinition,
   createReadToolDefinition, createWriteToolDefinition, createEditToolDefinition,
+  createMcpExtension, loadSkills, parseArgs, SessionManager,
   type ExtensionAPI, type ExtensionContext, type BashOperations, type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import type { SandboxManager } from "@anthropic-ai/sandbox-runtime";
@@ -15,6 +16,8 @@ import { commandLock, exited, terminate } from "./process.ts";
 import { present, requirements as inspectRequirements, prepareRuntime, policy, probeCode } from "./sandbox.ts";
 import { savedServices, serviceAction, serviceStatus, serviceText, socketPrefix } from "./features/service.ts";
 import { servicePlatform } from "./features/service-platform.ts";
+import { enterProfile } from "./features/launch.ts";
+import { parseProfile, profilePath, readProfile, saveProfile } from "./features/profile.ts";
 
 const packageRoot = import.meta.dirname;
 const toolNames = ["read", "bash", "edit", "write", "slice_service"];
@@ -35,6 +38,16 @@ function imageType(data: Buffer) {
 }
 
 export default function slice(pi: ExtensionAPI) {
+  pi.registerFlag("slice", {type: "boolean", description: "Restart with this workspace's minimal Slice configuration"});
+  const profile = enterProfile(packageRoot);
+  const profileRoot = profile ? realpathSync(process.cwd()) : undefined;
+  const configuration = profile ? "Slice" : "normal Pi";
+  const extraTools = profile?.tools ?? [];
+  const mcpEnabled = !!profile && !parseArgs(process.argv.slice(2)).noMcp && Object.keys(profile.mcpServers).length > 0;
+  const mcpPrefixes = mcpEnabled ? Object.keys(profile!.mcpServers).map(name => "mcp__" + name.replaceAll("-", "_") + "__") : [];
+  const allowed = (name: string) => toolNames.includes(name) || extraTools.includes(name) ||
+    mcpPrefixes.some(prefix => name.startsWith(prefix)) ||
+    (mcpEnabled && ["list_mcp_resources", "list_mcp_resource_templates", "read_mcp_resource"].includes(name));
   let ready = false,
     root = "",
     failure = "Sandbox is not ready.",
@@ -50,10 +63,17 @@ export default function slice(pi: ExtensionAPI) {
       throw Error(`pi-slice: ${ready ? "Workspace changed; restart Pi." : failure}`);
   };
   pi.on("project_trust", (_event, ctx) => ({ trusted: marked(ctx.cwd) ? "no" : "undecided" }));
+  if (profile) pi.on("session_before_switch", (event, ctx) => {
+    if (event.reason === "resume" && event.targetSessionFile && realpathSync(SessionManager.open(event.targetSessionFile).getCwd()) !== profileRoot) {
+      ctx.ui.notify("This session belongs to another workspace. Start pi --slice in that directory to use its configuration.", "warning");
+      return {cancel: true};
+    }
+  });
   pi.on("before_agent_start", (event, ctx) => {
     if (!ready || realpathSync(ctx.cwd) !== root) return;
     event.systemPromptOptions.sections.pi_slice = `You are in a Pi Slice workspace: ${root}.
 Pi keeps normal auth and sessions. Your read, bash, edit and write tools run inside an OS sandbox.
+Configuration: ${configuration}. Additional tools explicitly enabled by the user, including MCP servers, have their own permissions outside this sandbox.
 Bash, Bun (including TypeScript and bun:sqlite), Node/npm (including node:sqlite), Git and rg are available. Check other tools such as Python before relying on them.
 Default to Bun and TypeScript for new scripts and web projects: Bun.serve, Bun.file, bun run and bun add when dependencies are needed. Follow an existing project's stack or the user's preference.
 Match the requested scope. A basic HTML dashboard usually needs only index.html and a tiny server.ts, without framework scaffolding, custom APIs or a test harness. Inspect relevant project files; skip routine host/tool inventories. Do not assume Git is initialized.${process.platform === "darwin" ? " On macOS, new Git repositories must be initialized by the user in the host terminal; protected hooks/config prevent sandboxed git init. Git add/commit work for existing repositories." : ""}
@@ -68,12 +88,13 @@ These are user commands entered in Pi, not shell commands:
 /slice import <file.slice> <new-directory> — restore assets with a fresh workspace ID. Both transfer commands require the user's interactive password prompt.
 /slice run <command> — start a Unix-socket preview; /slice run --background <command> — start a worker; /slice logs and /slice stop — service controls.
 /slice services — user-only inventory; /slice stop <service-id> also works from unmarked Pi to stop a deleted workspace's service.
+/slice config — user-only editor for this workspace's extensions, skills, prompts, extra tools and MCP servers. Configuration changes require restarting pi --slice.
 You can build and test TypeScript/Bun dashboards. Cloudflare publishing or sharing needs a separate authenticated setup; Pi Slice provides no deployment or sharing command. Guide the user through host-side authentication without copying credentials into the workspace.
 Pi documentation and skill paths listed elsewhere may be hidden. Use this section for Pi Slice help instead of searching host directories.`;
   });
   pi.on("tool_call", (event, ctx) => {
-    if (protectedContext(ctx) && (!ready || !toolNames.includes(event.toolName) || realpathSync(ctx.cwd) !== root))
-      return { block: true, reason: `pi-slice: ${ready ? "Only read, bash, edit, write and slice_service are allowed." : failure}` };
+    if (protectedContext(ctx) && (!ready || !allowed(event.toolName) || realpathSync(ctx.cwd) !== root))
+      return { block: true, reason: `pi-slice: ${ready ? "Only read, bash, edit, write, slice_service and explicitly configured tools are allowed." : failure}` };
   });
   pi.on("user_bash", (_event, ctx) => {
     if (!protectedContext(ctx)) return;
@@ -91,9 +112,11 @@ Pi documentation and skill paths listed elsewhere may be hidden. Use this sectio
   });
 
   pi.on("session_start", async (_event, ctx) => {
-    if (!marked(ctx.cwd)) return;
+    if (!profile && !marked(ctx.cwd)) return;
     root = ctx.cwd;
     try {
+      if (profile && realpathSync(ctx.cwd) !== profileRoot)
+        throw Error("Slice configuration belongs to another workspace. Restart pi --slice in this directory.");
       const found = requirements(ctx.cwd);
       root = found.root;
       runtime = `Bun ${found.bunVersion} / Node ${found.nodeVersion}`;
@@ -103,7 +126,14 @@ Pi documentation and skill paths listed elsewhere may be hidden. Use this sectio
       const env = await lock(async () => {
         const env = prepareRuntime(join(root, ".pi-runtime"), found.tools);
         manager = (await import("@anthropic-ai/sandbox-runtime")).SandboxManager;
-        await manager.initialize(policy(root, found.tools, getAgentDir()));
+        const rules = policy(root, found.tools, getAgentDir());
+        if (profile) for (const skill of loadSkills({cwd: root, agentDir: getAgentDir(),
+          skillPaths: parseArgs(process.argv.slice(2)).skills ?? [], includeDefaults: false}).skills) {
+          // Selected skills need their instructions and bundled assets. Loose
+          // Markdown files grant access only to that file, not its parent.
+          rules.filesystem.allowRead.push(realpathSync(basename(skill.filePath) === "SKILL.md" ? skill.baseDir : skill.filePath));
+        }
+        await manager.initialize(rules);
         return env;
       });
       const run = <T>(work: (signal: AbortSignal) => Promise<T>, signal?: AbortSignal) => {
@@ -244,9 +274,10 @@ if(Buffer.isBuffer(result))process.stdout.write(result);
           return {content: [{type: "text", text: JSON.stringify(result)}], details: result};
         },
       });
-      pi.setActiveTools(toolNames);
+      pi.setActiveTools([...toolNames, ...extraTools, ...pi.getActiveTools().filter(name => mcpPrefixes.some(prefix => name.startsWith(prefix)))]);
       ready = true;
-      ctx.ui.setStatus("pi-slice", "🔒 Pi Slice · " + root);
+      ctx.ui.setStatus("pi-slice", `🔒 Sandbox active · ${configuration} configuration`);
+      if (!profile) ctx.ui.notify("Slice sandbox active; using your normal Pi configuration. Other extensions may operate outside the sandbox. Run pi --slice for this workspace's minimal configuration.", "warning");
     } catch (error) {
       ready = false;
       failure = error instanceof Error ? error.message : String(error);
@@ -256,7 +287,7 @@ if(Buffer.isBuffer(result))process.stdout.write(result);
   });
 
   pi.registerCommand("slice", {
-    description: "Workspace status, init, doctor, run, logs, stop, services, export, import",
+    description: "Workspace status, init, config, doctor, run, logs, stop, services, export, import",
     async handler(args, ctx) {
       try {
         const run = /^run(?:\s+(--background))?\s+([\s\S]+)$/.exec(args.trim());
@@ -268,9 +299,23 @@ if(Buffer.isBuffer(result))process.stdout.write(result);
         }
         const words = args.match(/"[^"]*"|'[^']*'|[^\s"']+/g) || [];
         const [command = "", ...values] = words.map(word => word.replace(/^["']|["']$/g, ""));
-        const limits: Record<string, number> = { "": 0, init: 1, doctor: 0, logs: 0, stop: 1, services: 0, export: 1, import: 2 };
+        const limits: Record<string, number> = { "": 0, init: 1, config: 0, doctor: 0, logs: 0, stop: 1, services: 0, export: 1, import: 2 };
         if (!Object.hasOwn(limits, command) || values.length > limits[command])
-          throw Error("Use /slice, init [new], doctor, run [--background] <command>, logs, stop [service-id], services, export [file.slice], or import <file.slice> <new-directory>.");
+          throw Error("Use /slice, init [new], config, doctor, run [--background] <command>, logs, stop [service-id], services, export [file.slice], or import <file.slice> <new-directory>.");
+        if (command === "config") {
+          const found = requirements(ctx.cwd), current = readProfile(found.root, getAgentDir());
+          const path = profilePath(found.root, getAgentDir());
+          saveProfile(found.root, getAgentDir(), current, true);
+          if (ctx.mode !== "tui") {
+            ctx.ui.notify(`Slice configuration: ${path}\nEdit this file from your host terminal, then restart pi --slice.`, "info");
+            return;
+          }
+          const text = await ctx.ui.editor("Slice configuration — added tools and MCP servers have their own permissions", JSON.stringify(current, null, 2));
+          if (text === undefined) return;
+          saveProfile(found.root, getAgentDir(), parseProfile(JSON.parse(text)));
+          ctx.ui.notify("Slice configuration saved. Restart pi --slice to apply it.", "info");
+          return;
+        }
         if (command === "services" || (command === "stop" && values.length)) {
           const saved = await savedServices(piHost());
           if (command === "services") {
@@ -297,7 +342,7 @@ if(Buffer.isBuffer(result))process.stdout.write(result);
           const available = (name: string) => {
             try { executable(name, ctx.cwd); return "available"; } catch { return "missing"; }
           };
-          let text = `pi-slice\nsandbox    ${status}\nworkspace  ${identity}\nruntime    ${runtime}\nexport     age ${available("age")}; tar ${available("tar")}`;
+          let text = `pi-slice\nsandbox    ${status}\nconfig     ${configuration}\nworkspace  ${identity}\nruntime    ${runtime}\nexport     age ${available("age")}; tar ${available("tar")}`;
           if (ready || isMarked) {
             const service = await serviceStatus(realpathSync(ctx.cwd), piHost());
             text += `\nservice    ${service.state}${service.url ? " · " + service.url : ""}${service.error ? " · " + service.error : ""}`;
@@ -325,7 +370,7 @@ if(Buffer.isBuffer(result))process.stdout.write(result);
               throw Error("Import outside this workspace and trusted Pi state/code.");
           }
           await (await import("./features/snapshot.ts")).restore(ctx, getAgentDir(), values[0], destination);
-          ctx.ui.notify(`Restored ${destination}.\ncd ${quote(destination)} && pi`, "info");
+          ctx.ui.notify(`Restored ${destination}.\ncd ${quote(destination)} && pi --slice`, "info");
           return;
         }
         const found = requirements(ctx.cwd);
@@ -340,11 +385,12 @@ if(Buffer.isBuffer(result))process.stdout.write(result);
               prepareRuntime(join(found.root, ".pi-runtime"), found.tools);
               ignoreRuntime(found.root);
             }
+            saveProfile(found.root, getAgentDir(), parseProfile({}), true);
           });
           if (ready) { ctx.ui.notify("This workspace is already isolated.", "info"); return; }
           if (!existing) {
             root = found.root;
-            failure = "Workspace initialized. Pi is closing. Run pi again to activate isolation.";
+            failure = "Workspace initialized. Pi is closing. Run pi again with --slice for sandboxed tools and a minimal configuration.";
             ctx.ui.notify(failure, "info");
             ctx.shutdown();
             return;
@@ -363,4 +409,9 @@ if(Buffer.isBuffer(result))process.stdout.write(result);
       }
     },
   });
+  if (mcpEnabled) {
+    for (const [name, config] of Object.entries(profile!.mcpServers))
+      pi.registerMcpServer(name, {exposure: "direct", ...config});
+    createMcpExtension({loadConfig: () => ({servers: [], errors: [], autoEnableCodemode: false})})(pi);
+  }
 }

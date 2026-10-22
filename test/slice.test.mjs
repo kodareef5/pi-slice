@@ -26,6 +26,8 @@ import { Header } from "tar";
 import { serviceAction, servicePaths } from "../features/service.ts";
 import { servicePlatform } from "../features/service-platform.ts";
 import { requirements } from "../sandbox.ts";
+import { parseProfile, profilePath, readProfile, saveProfile } from "../features/profile.ts";
+import { normalizeSliceFlag } from "../features/launch.ts";
 
 const packageRoot = dirname(import.meta.dirname);
 const pi = realpathSync(
@@ -93,6 +95,12 @@ test("Pi qualification accepts stable upgrades without an exact version pin", ()
     assert.doesNotThrow(() => requirements(project, { ...host, version }));
   for (const version of ["1.0.4", "1.3.0", "1.4.0-beta", "unknown"])
     assert.throws(() => requirements(project, { ...host, version }), /Pi 1\.4\.0 or newer required/);
+});
+
+test("Slice flags preserve prompts, option values and literal arguments", () => {
+  assert.deepEqual(normalizeSliceFlag(["--slice", "hello"]), ["--slice=true", "hello"]);
+  assert.deepEqual(normalizeSliceFlag(["--system-prompt", "--slice", "--slice", "hello"]), ["--system-prompt", "--slice", "--slice=true", "hello"]);
+  assert.deepEqual(normalizeSliceFlag(["--", "--slice"]), ["--", "--slice"]);
 });
 
 async function start(t, cwd = project, { args = [], environment = env } = {}) {
@@ -188,6 +196,163 @@ test("unmarked directories keep ordinary Pi, auth, environment and tools", async
   assert.equal(existsSync(join(plain, ".pi-runtime")), false);
   assert.equal(client.state.model.provider, "openai");
   assert.equal(readFileSync(join(agent, "auth.json"), "utf8"), original);
+});
+
+test("--slice restarts into a minimal session without changing accounts or settings", {timeout: 15000}, async t => {
+  mkdirSync(join(agent, "extensions"));
+  const factory = join(root, "factory-ran"), started = join(root, "hook-ran");
+  writeFileSync(join(agent, "extensions/noisy.ts"), `import {writeFileSync} from 'node:fs'; export default pi => {
+    writeFileSync(${JSON.stringify(factory)}, 'yes');
+    pi.on('session_start', () => writeFileSync(${JSON.stringify(started)}, 'yes'));
+    pi.registerCommand('noise', {handler(){}});
+  };`);
+  mkdirSync(join(agent, "prompts"));
+  writeFileSync(join(agent, "prompts/noisy.md"), "Global prompt");
+  mkdirSync(join(agent, "skills/noisy"), {recursive: true});
+  writeFileSync(join(agent, "skills/noisy/SKILL.md"), "---\nname: noisy\ndescription: Fixture\n---\nGlobal skill");
+  const mcpStarted = join(root, "global-mcp-ran");
+  writeFileSync(join(agent, "mcp.json"), JSON.stringify({mcpServers: {global: {
+    command: process.execPath, args: ["-e", `require('fs').writeFileSync(${JSON.stringify(mcpStarted)},'yes')`],
+  }}}));
+  const savedSettings = readFileSync(join(agent, "settings.json"), "utf8");
+  const savedAuth = readFileSync(join(agent, "auth.json"), "utf8");
+  const client = await start(t, project, {args: ["--slice"]});
+  assert.deepEqual((await client.request({type: "get_commands"})).commands.map(c => c.name), ["slice"]);
+  assert.equal(existsSync(started), false);
+  assert.equal(existsSync(mcpStarted), false);
+  assert.match(await client.command("/slice doctor", "pi-slice\n"), /sandbox    healthy\nconfig     Slice/);
+  assert.ok(!client.notices.some(text => text.includes("using your normal Pi configuration")));
+  assert.equal(client.state.model.provider, "openai");
+  assert.equal(readFileSync(join(agent, "settings.json"), "utf8"), savedSettings);
+  assert.equal(readFileSync(join(agent, "auth.json"), "utf8"), savedAuth);
+  const path = profilePath(project, agent);
+  assert.ok(existsSync(path));
+  assert.equal((await client.bash(`cat '${path}'`)).exitCode, 1);
+  assert.equal((await client.bash("printf slice-ok > slice.txt")).exitCode, 0);
+  assert.equal(readFileSync(join(project, "slice.txt"), "utf8"), "slice-ok");
+});
+
+test("normal Pi keeps the sandbox and explains which configuration is loaded", async t => {
+  const client = await start(t);
+  assert.ok(client.notices.some(text => text.includes("Slice sandbox active; using your normal Pi configuration")));
+  assert.match(await client.command("/slice", "pi-slice\n"), /sandbox    healthy\nconfig     normal Pi/);
+  assert.notEqual((await client.bash(`cat '${outside}'`)).exitCode, 0);
+});
+
+test("Slice configuration is private, per directory and opt-in", async t => {
+  saveProfile(project, agent, parseProfile({tools: ["fixture_extra"], contextFiles: false}));
+  copyFileSync(join(project, ".pi-slice"), join(plain, ".pi-slice"));
+  assert.deepEqual(readProfile(plain, agent), parseProfile({}));
+  const path = profilePath(project, agent);
+  assert.equal(statSync(path).mode & 0o777, 0o600);
+  const client = await start(t);
+  assert.match(await client.command("/slice config", "Slice configuration:"), /restart pi --slice/);
+  assert.throws(() => parseProfile({extensions: "bad"}), /array/);
+  assert.throws(() => parseProfile({mcpServers: {"bad name": {url: "https://example.com"}}}), /server name/);
+});
+
+test("Slice loads selected resources and executes opted-in tools and MCP", {timeout: 20000}, async t => {
+  const requests = [], calls = [];
+  const server = createServer(async (request, response) => {
+    let body = "";
+    for await (const chunk of request) body += chunk;
+    const data = JSON.parse(body);
+    requests.push(data);
+    const call = data.messages.at(-1).role === "tool" ? undefined : calls.shift();
+    const delta = call ? {role: "assistant", tool_calls: [{index: 0, id: "call-" + requests.length,
+      type: "function", function: {name: call.name, arguments: JSON.stringify(call.args)}}]} : {content: "Done."};
+    response.writeHead(200, {"content-type": "text/event-stream"});
+    response.end(`data: ${JSON.stringify({id: "fixture", object: "chat.completion.chunk", created: 1, model: "fixture",
+      choices: [{index: 0, delta, finish_reason: call ? "tool_calls" : "stop"}]})}\n\ndata: [DONE]\n\n`);
+  });
+  await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise(resolve => server.close(resolve)));
+  const addon = join(home, "chosen.ts"), skill = join(home, "chosen-skill"), prompt = join(home, "chosen-prompt.md");
+  mkdirSync(skill);
+  writeFileSync(join(skill, "SKILL.md"), "---\nname: chosen-skill\ndescription: Selected skill\n---\nSELECTED_SKILL_CONTENT");
+  writeFileSync(join(skill, "asset.txt"), "SELECTED_SKILL_ASSET");
+  writeFileSync(prompt, "Selected prompt");
+  writeFileSync(join(agent, "AGENTS.md"), "GLOBAL_CONTEXT_SENTINEL");
+  writeFileSync(join(agent, "SYSTEM.md"), "GLOBAL_SYSTEM_SENTINEL");
+  writeFileSync(join(agent, "APPEND_SYSTEM.md"), "GLOBAL_APPEND_SENTINEL");
+  writeFileSync(addon, `import {Type} from '@earendil-works/pi-ai'; export default pi => {
+    pi.registerProvider('slice-fixture', {baseUrl: 'http://127.0.0.1:${server.address().port}/v1',
+      apiKey: 'fixture-only', api: 'openai-completions', models: [{id: 'fixture', name: 'fixture',
+      contextWindow: 32768, maxTokens: 1024, reasoning: false, input: ['text'], cost: {input: 0, output: 0, cacheRead: 0, cacheWrite: 0}}]});
+    for (const name of ['fixture_extra', 'fixture_blocked']) pi.registerTool({name, label: name, description: name,
+      parameters: Type.Object({}), async execute(){return {content:[{type:'text',text:'OPTED_IN_TOOL_OK'}],details:{}}}});
+    pi.registerCommand('chosen', {handler(args, ctx){ctx.ui.notify('CHOSEN:' + JSON.stringify({
+      tools: pi.getActiveTools(), prompt: ctx.getSystemPromptOptions()}), 'info')}});
+  };`);
+  const mcp = join(home, "mcp.mjs"), mcpCalls = join(home, "mcp-calls");
+  writeFileSync(mcp, `import {createInterface} from 'node:readline'; import {appendFileSync} from 'node:fs';
+    createInterface({input: process.stdin}).on('line', line => {
+      const r = JSON.parse(line); if (r.id === undefined) return;
+      let result;
+      if (r.method === 'initialize') result = {protocolVersion: r.params.protocolVersion, capabilities: {tools:{}}, serverInfo: {name:'fixture', version:'1'}};
+      else if (r.method === 'tools/list') result = {tools: [{name:'ping', description:'Fixture ping', inputSchema:{type:'object',properties:{}}}]};
+      else if (r.method === 'tools/call') {appendFileSync(${JSON.stringify(mcpCalls)}, r.params.name + '\\n'); result = {content:[{type:'text',text:'MCP_PONG'}]};}
+      else result = {};
+      process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:r.id,result}) + '\\n');
+    });`);
+  saveProfile(project, agent, parseProfile({extensions: [addon], skills: [skill], prompts: [prompt],
+    tools: ["fixture_extra"], mcpServers: {chosen: {command: process.execPath, args: [mcp]}}}));
+  const client = await start(t, project, {args: ["--slice", "--model", "slice-fixture/fixture"]});
+  const commands = (await client.request({type: "get_commands"})).commands.map(c => c.name);
+  for (const name of ["slice", "chosen", "chosen-prompt", "skill:chosen-skill", "mcp"]) assert.ok(commands.includes(name), commands.join(", "));
+  const info = JSON.parse((await client.command("/chosen", "CHOSEN:")).slice(7));
+  assert.ok(info.tools.includes("fixture_extra"));
+  assert.ok(!info.tools.includes("fixture_blocked"), JSON.stringify({info, notices: client.notices}));
+  assert.doesNotMatch(JSON.stringify(info.prompt), /GLOBAL_(CONTEXT|SYSTEM|APPEND)_SENTINEL/);
+  assert.deepEqual(info.prompt.skills.map(s => s.name), ["chosen-skill"]);
+  const turn = async (name, args = {}) => {
+    calls.push({name, args});
+    const done = client.receive("agent_end", () => true);
+    await client.request({type: "prompt", message: "Run the fixture tool."});
+    await done;
+    assert.equal(calls.length, 0);
+    return requests.at(-1).messages.at(-1).content;
+  };
+  assert.match(await turn("fixture_extra"), /OPTED_IN_TOOL_OK/);
+  assert.match(await turn("mcp__chosen__ping"), /MCP_PONG/);
+  assert.equal(readFileSync(mcpCalls, "utf8"), "ping\n");
+  assert.match(await turn("read", {path: join(skill, "SKILL.md")}), /SELECTED_SKILL_CONTENT/);
+  assert.equal((await client.bash(`cat '${join(skill, "asset.txt")}'`)).output.trim(), "SELECTED_SKILL_ASSET");
+  assert.notEqual((await client.bash(`echo overwrite > '${join(skill, "SKILL.md")}'`)).exitCode, 0);
+  assert.notEqual((await client.bash(`cat '${outside}'`)).exitCode, 0);
+  await client.close();
+});
+
+test("--slice rejects missing or invalid setup instead of starting a normal session", () => {
+  const run = (cwd, args) => spawnSync(process.execPath, [pi, "--offline", "--mode", "rpc", ...args], {
+    cwd, env, input: "", encoding: "utf8", timeout: 10000,
+  });
+  const missing = run(plain, ["--slice"]);
+  assert.notEqual(missing.status, 0);
+  assert.match(missing.stdout + missing.stderr, /initialized workspace/);
+  const approved = run(project, ["--slice", "--approve"]);
+  assert.notEqual(approved.status, 0);
+  assert.match(approved.stdout + approved.stderr, /cannot be combined/);
+  const path = saveProfile(project, agent, parseProfile({}));
+  writeFileSync(path, '{"extensions":"bad"}');
+  const invalid = run(project, ["--slice"]);
+  assert.notEqual(invalid.status, 0);
+  assert.match(invalid.stdout + invalid.stderr, /array of nonempty strings/);
+  assert.equal(run(plain, ["--slice", "--help"]).status, 0);
+});
+
+test("a Slice session cannot switch to a different workspace's profile", async t => {
+  const other = await start(t, plain);
+  await other.fixture({op: "persist"});
+  const target = other.state.sessionFile;
+  await other.close();
+  const client = await start(t, project, {args: ["--slice"]});
+  const state = client.state;
+  const switched = await client.request({type: "switch_session", sessionPath: target});
+  assert.equal(switched.cancelled, true);
+  assert.equal((await client.request({type: "get_state"})).sessionId, state.sessionId);
+  assert.ok(client.notices.some(n => n.includes("belongs to another workspace")));
+  assert.notEqual((await client.bash(`cat '${outside}'`)).exitCode, 0);
 });
 
 test("pi install discovers /slice without a /work alias and isolates after restart", { timeout: 20000 }, async (t) => {
@@ -384,7 +549,7 @@ test("file tools preserve text, edits and images without exposing host files", a
   await assert.rejects(client.tool("read", { path: "host-link" }));
   assert.equal(readFileSync(outside, "utf8"), "host secret");
   assert.equal(readFileSync(visible, "utf8"), "read only");
-  await assert.rejects(client.tool("fixture-host", {}), /Only read, bash, edit, write and slice_service/);
+  await assert.rejects(client.tool("fixture-host", {}), /Only read, bash, edit, write/);
   writeFileSync(
     join(project, "pixel.png"),
     Buffer.from(
@@ -420,11 +585,12 @@ test("continue and resume keep native sessions and auth", async (t) => {
   await client.fixture({ op: "persist" });
   await client.bash("echo NATIVE_SESSION");
   await client.close();
-  for (const args of [["-c"], ["--session", file]]) {
+  for (const args of [["-c"], ["--session", file], ["--slice", "-c"], ["--slice", "--session", file]]) {
     const resumed = await start(t, project, { args });
     assert.equal(resumed.state.sessionFile, file);
     assert.equal(resumed.state.model.provider, "openai");
-    assert.equal((await resumed.bash("echo PASS")).exitCode, 0);
+    const shell = await resumed.bash("echo PASS");
+    assert.equal(shell.exitCode, 0, JSON.stringify({args, shell, notices: resumed.notices}));
     await resumed.close();
   }
   assert.equal(readFileSync(join(agent, "auth.json"), "utf8"), before);
@@ -531,7 +697,7 @@ test("dependency drift and an unconfined runtime block every tool", async (t) =>
   mkdirSync(runtime, { recursive: true });
   mkdirSync(join(isolated, "test"));
   mkdirSync(join(isolated, "features"));
-  for (const file of ["extension.ts", "sandbox.ts", "workspace.ts", "process.ts", "features/service.ts", "features/service-platform.ts", "test/driver.ts"])
+  for (const file of ["extension.ts", "sandbox.ts", "workspace.ts", "process.ts", "features/service.ts", "features/service-platform.ts", "features/launch.ts", "features/profile.ts", "test/driver.ts"])
     copyFileSync(join(packageRoot, file), join(isolated, file));
   writeFileSync(join(isolated, "package.json"), '{"type":"module"}');
   writeFileSync(
@@ -563,7 +729,7 @@ test("removing the marker cannot disable a running sandbox", async (t) => {
   t.after(() => mark(project));
   assert.match((await client.bash("echo $HOME")).output, /\.pi-runtime\/home/);
   await assert.rejects(client.tool("read", { path: outside }));
-  await assert.rejects(client.tool("fixture-host", {}), /Only read, bash, edit, write and slice_service/);
+  await assert.rejects(client.tool("fixture-host", {}), /Only read, bash, edit, write/);
 });
 
 test("Node version rejection happens before workspace mutation", async (t) => {
