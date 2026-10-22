@@ -442,7 +442,8 @@ async function probe({ outside, visible, agent, port, nodeVersion, npmVersion })
       }
     } else denied(() => fs.writeFileSync(path, "escape"));
   }
-  for (const path of [".pi-slice", ".pi/sentinel", ".git/config", ".git/hooks/sentinel", "/tmp/claude/pi-slice-test"])
+  fs.writeFileSync(".git/config", "[core]\n");
+  for (const path of [".pi-slice", ".pi/sentinel", ".git/hooks/sentinel", "/tmp/claude/pi-slice-test"])
     denied(() => fs.writeFileSync(path, "escape"));
   const link = ".pi-runtime/link-" + process.pid;
   fs.symlinkSync(outside, link);
@@ -536,7 +537,10 @@ test("file tools preserve text, edits and images without exposing host files", a
   for (const path of [outside, join(agent, "auth.json"), "host-link"])
     await assert.rejects(client.tool("read", { path }));
   assert.match((await client.tool("read", { path: "visible-link" })).content[0].text, /read only/);
-  for (const path of [".pi-slice", ".pi/sentinel", ".git/config", ".git/hooks/sentinel", visible, "visible-link"]) {
+  await client.tool("write", { path: ".git/config", content: "[core]\n\tbare = false\n" });
+  await client.tool("edit", { path: ".git/config", edits: [{ oldText: "false", newText: "true" }] });
+  assert.match(readFileSync(join(project, ".git/config"), "utf8"), /bare = true/);
+  for (const path of [".pi-slice", ".pi/sentinel", ".git/hooks/sentinel", visible, "visible-link"]) {
     await assert.rejects(client.tool("write", { path, content: "escape" }), /EPERM|EACCES|EROFS|ENOENT/);
     await assert.rejects(client.tool("edit", { path, edits: [{ oldText: "protected", newText: "escape" }] }));
   }
@@ -621,7 +625,8 @@ test("session switching follows ctx.cwd and restores unmarked directories", asyn
   await client.request({ type: "switch_session", sessionPath: targetFile });
   assert.equal((await client.fixture({ op: "info" })).cwd, other);
   assert.equal((await client.fixture({ op: "info" })).processCwd, plain);
-  for (const path of [".git/hooks/new", ".git/config", ".vscode/tasks.json", "vendor/x/.git/hooks/new"])
+  await client.tool("write", { path: ".git/config", content: "[core]\n" });
+  for (const path of [".git/hooks/new", ".vscode/tasks.json", "vendor/x/.git/hooks/new"])
     await assert.rejects(client.tool("write", { path, content: "escape" }));
   assert.match((await client.tool("read", { path: "which.txt" })).content[0].text, /second workspace/);
   await assert.rejects(client.tool("read", { path: join(project, "large.txt") }));
@@ -891,12 +896,60 @@ test("archive extraction rejects traversal, escaping links, special files and du
   assert.equal(existsSync(join(root, "escape")), false);
 });
 
+test("ordinary Git clones and nested init use standard metadata in both session modes", async (t) => {
+  const source = join(project, "upstream");
+  mkdirSync(source);
+  const git = (args) => {
+    const result = spawnSync("git", args, {
+      cwd: source, encoding: "utf8",
+      env: {PATH: env.PATH, HOME: home, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1"},
+    });
+    assert.equal(result.status, 0, result.stderr);
+  };
+  git(["init", "--template="]);
+  writeFileSync(join(source, "hello.txt"), "cloned fixture\n");
+  git(["add", "hello.txt"]);
+  git(["-c", "user.name=Fixture", "-c", "user.email=fixture@example.com", "commit", "-m", "fixture"]);
+  git(["update-server-info"]);
+  // Dumb HTTP exercises Git through the sandbox proxy without external services.
+  const server = createServer((request, response) => {
+    const path = new URL(request.url, "http://fixture").pathname;
+    try { response.end(readFileSync(join(source, ".git", path))); }
+    catch { response.writeHead(404); response.end(); }
+  });
+  await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise(resolve => server.close(resolve)));
+  const url = `http://127.0.0.1:${server.address().port}`;
+  const normal = await start(t);
+  const minimal = await start(t, project, {args: ["--slice"]});
+  for (const [name, run] of [
+    ["user", command => normal.bash(command)],
+    ["model", async command => {
+      const result = (await normal.tool("bash", {command})).structuredContent;
+      return {exitCode: result.exit_code, output: result.output};
+    }],
+    ["minimal", command => minimal.bash(command)],
+  ]) {
+    // The local fixture also needs the proxy: direct loopback is sandboxed.
+    const result = await run(`export NO_PROXY= no_proxy=; git clone '${url}' ${name}-clone && git init ${name}-new && ` +
+      `git -C ${name}-clone config slice.fixture yes && git -C ${name}-clone status --porcelain`);
+    assert.equal(result.exitCode, 0, result.output);
+    for (const dir of [`${name}-clone`, `${name}-new`]) {
+      assert.equal(statSync(join(project, dir, ".git")).isDirectory(), true);
+      assert.equal(existsSync(join(project, dir, ".git/hooks/commit-msg.sample")), false);
+    }
+    assert.equal(readFileSync(join(project, `${name}-clone/hello.txt`), "utf8"), "cloned fixture\n");
+    assert.match(readFileSync(join(project, `${name}-clone/.git/config`), "utf8"), /fixture = yes/);
+  }
+  await assert.rejects(normal.tool("write", {path: "user-clone/.git/hooks/pre-commit", content: "blocked"}));
+});
+
 test("fresh Git initialization and commits use only host name/email", async (t) => {
   rmSync(join(project, ".git"), { recursive: true });
   const client = await start(t);
   if (process.platform === "darwin") {
-    // Seatbelt pins the parents of protected hooks/config even before they
-    // exist. New repositories need host initialization; commits stay sandboxed.
+    // Seatbelt pins the workspace-root .git parent of protected hooks even
+    // before it exists. Nested init/clone work; root init still needs the host.
     const denied = await client.bash("git init");
     assert.notEqual(denied.exitCode, 0);
     assert.match(denied.output, /Operation not permitted|Permission denied/);

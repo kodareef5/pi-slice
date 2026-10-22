@@ -16,7 +16,7 @@ socat and flock. Export/import needs age. Sandbox-runtime is pinned to 0.0.78.
 ```sh
 pi install git:github.com/kodareef5/pi-slice
 mkdir -p ~/my-project && cd ~/my-project
-git init # optional; on macOS, initialize Git here before entering Pi
+git init # optional; on macOS, initialize the workspace-root repository here
 pi
 ```
 
@@ -127,14 +127,22 @@ the project. Use `/slice run --background <command>` for a worker without a prev
 Snapshots include Git and project secrets, exclude runtime/dependencies, and assign a
 fresh workspace ID on import. They do not collect Pi accounts or conversations.
 
+Git clones and `git init <subdirectory>` work inside the workspace with standard
+`.git` directories. Repository-local Git configuration is writable. Default Git
+templates are skipped so cloning does not try to copy sample hooks into protected
+paths. Git still uses an isolated HOME and ignores host system/global config;
+only the host's author name and email are carried over.
+
 Homes and Pi state are hidden; other host paths, including `/tmp`, remain readable.
 Tool writes stay in the project; service runtime is private Pi state, never exported.
 Proxied internet includes local/LAN services. Linux hides
 `/run` and `/var/run`, but permits sockets on other visible paths. Pi and global
 extensions remain trusted host code; running generated files on the host bypasses
-this boundary. macOS protects Git hooks/config and their parent paths, so new Git
-repositories must be initialized from the host terminal. Git add/commit work inside
-Pi once the repository exists. The restored extension is tested on macOS arm64
+this boundary. Writes to conventional `.git/hooks` paths remain blocked. On macOS,
+the workspace-root `.git` directory is also pinned, so `git init` at that root
+still needs the host terminal. Cloning and initializing repositories in
+subdirectories work inside Pi, as do add/commit in existing repositories.
+The restored extension is tested on macOS arm64
 with Pi 1.4.0. The original extension was also tested on Ubuntu; the Pi 1.4 update
 has not yet been revalidated on Linux. WSL is unverified.
 
